@@ -360,11 +360,12 @@ _HERMES_ENV_PATH = (
 # ~/.hermes/config.yaml IS the security policy: approvals.mode, yolo, and the
 # permanent-approval allowlist live here, and the config cache is mtime-keyed
 # so a write takes effect mid-session (the agent could flip approvals.mode=off
-# and immediately bypass the gate). Pair the write_file/patch deny (file_tools
-# _check_sensitive_path) with terminal-side coverage so `sed -i`, `tee`, `>`,
-# `cp`, etc. targeting it are gated too — otherwise the deny is unpaired
-# theater. Mirrors _HERMES_ENV_PATH; matches the HERMES_HOME override form as
-# well as ~/.hermes/.
+# and immediately bypass the gate). Terminal writes and the file_tools
+# write/patch path BOTH gate this file with a one-operation human approval
+# (file_tools _check_sensitive_path routes through the approval gate, not a
+# bare deny) so `sed -i`, `tee`, `>`, `cp`, etc. targeting it are gated on
+# both surfaces. Mirrors _HERMES_ENV_PATH; matches the HERMES_HOME override
+# form as well as ~/.hermes/.
 _HERMES_CONFIG_PATH = (
     r'(?:~\/\.hermes/|'
     r'(?:\$home|\$\{home\})/\.hermes/|'

@@ -693,16 +693,35 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
             return _err
     if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
         return _err
-    # Prevent agents from modifying the Hermes config file directly.
-    # approvals.mode and other security settings live here; a malicious or
-    # prompt-injected agent could silently disable exec approval by writing to
-    # this file.
+    # The Hermes config file IS the security policy (approvals.mode, yolo,
+    # the permanent-approval allowlist) and the config cache is mtime-keyed
+    # so a write takes effect mid-session. A prompt-injected agent must not
+    # be able to edit it silently. But a hard deny is unpaired theater:
+    # the terminal tool APPROVAL-GATES the same file (`sed -i`, `tee`, `>`
+    # — approval.py _HERMES_CONFIG_PATH), so the file-tool path was the
+    # only surface that never even asked the human. Route through the same
+    # one-operation approval gate as protected instruction files: human
+    # decides every time, no yolo bypass, fail-closed when headless.
     hermes_config = _get_hermes_config_resolved()
     if hermes_config and (resolved == hermes_config or normalized == hermes_config):
-        return (
-            f"Refusing to write to Hermes config file: {filepath}\n"
-            "Agent cannot modify security-sensitive configuration. "
-            "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead."
+        return _request_one_operation_approval(
+            display=f"<write to {hermes_config}>",
+            description=(
+                f"Write to the Hermes config file ({hermes_config}). This "
+                "file holds the security policy (approvals.mode, yolo, "
+                "permanent approvals); one-time human approval is always "
+                "required (not bypassed by auto-approve)."
+            ),
+            blocked=(
+                f"BLOCKED: write to the Hermes config file "
+                f"({hermes_config}) "
+                "{why} The user has NOT consented to this write. Use "
+                "'hermes config set' instead, or ask again so the human "
+                "can approve. Do NOT retry it or attempt the same edit "
+                "via another path (terminal, execute_code, etc.)."
+            ),
+            pattern_key="hermes_config_file",
+            task_id=task_id,
         )
     return None
 
@@ -836,9 +855,11 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
     return None
 
 
-def _request_protected_instruction_approval(
-        reasons: list[str], task_id: str = "default") -> str | None:
-    """Ask the human to approve a write to protected instruction file(s).
+def _request_one_operation_approval(
+        display: str, description: str, blocked: str,
+        pattern_key: str, task_id: str = "default",
+) -> str | None:
+    """Ask the human to approve a security-sensitive write (one operation).
 
     Returns ``None`` when approved, or a BLOCKED error string. This gate
     intentionally does NOT route through ``_run_approval_gate``: that gate
@@ -846,19 +867,6 @@ def _request_protected_instruction_approval(
     here is one-operation approval EVERY time, with no persistent scope
     and no yolo bypass. Fail-closed when no human channel exists.
     """
-    targets = ", ".join(dict.fromkeys(reasons))
-    description = (
-        f"Write to protected agent-instruction file(s): {targets}. "
-        "These files steer future agent behavior; approval is always "
-        "required (not bypassed by auto-approve)."
-    )
-    display = f"<write to {targets}>"
-    blocked = (
-        f"BLOCKED: write to protected agent-instruction file(s) ({targets}) "
-        "{why} The user has NOT consented to this write. Do NOT retry it or "
-        "attempt the same edit via another path (terminal, execute_code, "
-        "etc.)."
-    )
 
     try:
         import tools.approval as _approval
@@ -880,8 +888,8 @@ def _request_protected_instruction_approval(
     if notify_cb is not None:
         approval_data = {
             "command": display,
-            "pattern_key": "protected_instruction_file",
-            "pattern_keys": ["protected_instruction_file"],
+            "pattern_key": pattern_key,
+            "pattern_keys": [pattern_key],
             "description": description,
             "allow_permanent": False,
             "allow_session": False,
@@ -956,7 +964,24 @@ def _check_protected_instruction_write(paths: list[str],
             reasons.append(reason)
     if not reasons:
         return None
-    return _request_protected_instruction_approval(reasons, task_id)
+    targets = ", ".join(dict.fromkeys(reasons))
+    return _request_one_operation_approval(
+        display=f"<write to {targets}>",
+        description=(
+            f"Write to protected agent-instruction file(s): {targets}. "
+            "These files steer future agent behavior; approval is always "
+            "required (not bypassed by auto-approve)."
+        ),
+        blocked=(
+            f"BLOCKED: write to protected agent-instruction file(s) "
+            f"({targets}) "
+            "{why} The user has NOT consented to this write. Do NOT retry "
+            "it or attempt the same edit via another path (terminal, "
+            "execute_code, etc.)."
+        ),
+        pattern_key="protected_instruction_file",
+        task_id=task_id,
+    )
 
 
 def _check_approval_required_write(paths: list[str],

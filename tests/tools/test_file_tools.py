@@ -454,6 +454,47 @@ class TestSensitivePathCheck:
         assert "error" in result
         assert "Hermes config" in result["error"]
 
+    def test_hermes_config_write_approved_via_callback(self, tmp_path, monkeypatch):
+        """One-operation approval gate: an approving human lets the write
+        through (this is a gate, not a hard deny) — pairing the file-tool
+        surface with the terminal surface, which approval-gates the same
+        file."""
+        fake_config = tmp_path / "config.yaml"
+        monkeypatch.setattr("tools.file_tools._hermes_config_resolved", str(fake_config))
+        monkeypatch.setattr("tools.file_tools._hermes_config_resolved_loaded", True)
+        monkeypatch.setattr(
+            "tools.terminal_tool._get_approval_callback",
+            lambda: (lambda *a, **kw: "once"),
+        )
+
+        @patch("tools.file_tools._get_file_ops")
+        def _write(mock_get):
+            mock_ops = MagicMock()
+            result_obj = MagicMock()
+            result_obj.to_dict.return_value = {"status": "ok", "path": str(fake_config), "bytes": 3}
+            mock_ops.write_file.return_value = result_obj
+            mock_get.return_value = mock_ops
+            from tools.file_tools import write_file_tool
+            return json.loads(write_file_tool(str(fake_config), "x: 1\n"))
+
+        result = _write()
+        assert result["status"] == "ok"
+
+    def test_hermes_config_blocked_headless_fails_closed(self, tmp_path, monkeypatch):
+        """No human channel (cron/background/script): the approval gate must
+        fail closed — silence is not consent."""
+        fake_config = tmp_path / "config.yaml"
+        monkeypatch.setattr("tools.file_tools._hermes_config_resolved", str(fake_config))
+        monkeypatch.setattr("tools.file_tools._hermes_config_resolved_loaded", True)
+        # No gateway notify callback and no CLI approval callback: headless.
+        monkeypatch.setattr("tools.approval._gateway_notify_cbs", {})
+
+        from tools.file_tools import write_file_tool
+        result = json.loads(write_file_tool(str(fake_config), "x: 1\n"))
+        assert "error" in result
+        assert "BLOCKED" in result["error"]
+        assert "no interactive user or gateway" in result["error"]
+
 
     def test_system_path_still_blocked(self, monkeypatch):
         monkeypatch.setattr("tools.file_tools._hermes_config_resolved", "/some/other/path")
