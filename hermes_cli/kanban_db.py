@@ -5376,6 +5376,7 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
+    head_sha: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
 
@@ -5408,6 +5409,13 @@ def complete_task(
     Any suspected phantom references are recorded as a
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
+
+    Review approvals (the task is in ``review``, or running under a run
+    claimed from ``review``) are gated on an Orda PASS for the exact head
+    sha (t_159b0030). Pass it as ``head_sha`` or ``metadata["head_sha"]``.
+    Without a matching ``orda_pass`` event the call raises
+    :class:`OrdaPassRequiredError` and the task is not mutated. Disable
+    only with ``kanban.require_orda_pass: false``.
     """
     now = int(time.time())
     # Fail before validating cards or staging artifacts; re-check inside the
@@ -5441,6 +5449,12 @@ def complete_task(
             raise HallucinatedCardsError(phantom_cards, task_id)
     else:
         verified_cards = []
+
+    # Gate: review approvals need an Orda PASS for the exact head sha.
+    # Raises before any task mutation (t_159b0030).
+    orda_pass = _enforce_orda_gate_for_completion(
+        conn, task_id, head_sha=head_sha, metadata=metadata,
+    )
 
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
@@ -5547,6 +5561,12 @@ def complete_task(
         }
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
+        if orda_pass:
+            completed_payload["orda_pass"] = {
+                "sha": orda_pass.get("sha"),
+                "receipt_id": orda_pass.get("receipt_id"),
+                "reviewer": orda_pass.get("reviewer"),
+            }
         # Carry artifact paths in the event payload so the gateway
         # notifier can upload them as native attachments alongside the
         # completion message. Workers pass these via
@@ -9801,6 +9821,298 @@ def select_reviewer(
             continue
         return norm, builders
     return None, builders
+
+
+# ---------------------------------------------------------------------------
+# Orda PASS ship gate (t_159b0030)
+#
+# A review approval (``review -> done``, or ``kanban_complete`` from a run
+# claimed out of the review lane) and any merge or deploy that consults
+# :func:`check_ship_allowed` / ``hermes kanban ship-gate`` require an
+# ``orda_pass`` event on the card whose ``sha`` equals the exact head sha
+# being shipped.
+#
+# Event shape (``task_events`` row, ``kind = 'orda_pass'``)::
+#
+#     {"schema": 1, "verdict": "PASS", "sha": "<40 or 64 hex, lowercase>",
+#      "receipt_id": "<tester receipt id>", "reviewer": "<orda profile>"}
+#
+# Only :func:`record_orda_pass` writes it. That function refuses actors
+# that are not listed in ``kanban.orda_profiles`` (default ``["orda"]``),
+# actors that built the card, and calls made from inside a kanban worker
+# run whose profile is not an Orda profile. No agent tool exposes it.
+# ---------------------------------------------------------------------------
+
+ORDA_PASS_EVENT = "orda_pass"
+ORDA_GATE_BLOCKED_EVENT = "ship_blocked_orda_gate"
+ORDA_PASS_SCHEMA = 1
+DEFAULT_ORDA_PROFILES: tuple[str, ...] = ("orda",)
+_FULL_SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+_RECEIPT_ID_MAX_LEN = 200
+
+
+class OrdaPassRequiredError(ValueError):
+    """Raised when a review approval or ship lacks a matching Orda PASS.
+
+    Subclasses ``ValueError`` so existing CLI and tool handlers that map
+    ``ValueError`` to a clean error message surface it without a trace.
+    """
+
+    def __init__(self, task_id: str, reason: str):
+        self.task_id = task_id
+        self.reason = reason
+        super().__init__(
+            f"ship refused for {task_id}: {reason}. An Orda PASS "
+            f"('{ORDA_PASS_EVENT}' event) for the exact head sha is required "
+            "before review approval, merge, or deploy."
+        )
+
+
+def orda_profiles() -> list[str]:
+    """Profiles allowed to record an Orda PASS (``kanban.orda_profiles``)."""
+    return _config_profile_list("orda_profiles", DEFAULT_ORDA_PROFILES)
+
+
+def orda_gate_enabled() -> bool:
+    """Whether the Orda PASS gate is enforced (``kanban.require_orda_pass``).
+
+    Defaults to ``True``. Operators can disable it only by explicitly
+    setting the key to ``false``.
+    """
+    raw = _kanban_config_section().get("require_orda_pass", True)
+    if isinstance(raw, str):
+        return raw.strip().lower() not in {"0", "false", "no", "off"}
+    return bool(raw)
+
+
+def normalize_sha(sha: Any) -> Optional[str]:
+    """Return a full lowercase hex commit sha, or ``None`` when invalid.
+
+    Abbreviated shas are rejected on purpose: the gate binds to one exact
+    commit.
+    """
+    if not isinstance(sha, str):
+        return None
+    norm = sha.strip().lower()
+    return norm if _FULL_SHA_RE.match(norm) else None
+
+
+def _current_worker_run_profile(
+    conn: sqlite3.Connection, worker_task_id: str,
+) -> tuple[bool, Optional[str]]:
+    """Return ``(found, profile)`` for the active run of ``worker_task_id``.
+
+    Looks in the same board DB first. ``found`` is ``False`` when the task
+    or its active run is not in this DB (a worker on another board).
+    """
+    row = conn.execute(
+        "SELECT r.profile AS profile FROM tasks t "
+        "JOIN task_runs r ON r.id = t.current_run_id WHERE t.id = ?",
+        (worker_task_id,),
+    ).fetchone()
+    if row is None:
+        return False, None
+    return True, _normalize_profile(row["profile"])
+
+
+def record_orda_pass(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    sha: str,
+    receipt_id: str,
+    actor: str,
+    env: Optional[Mapping[str, str]] = None,
+) -> dict:
+    """Record an Orda PASS for ``sha`` on ``task_id`` and return its payload.
+
+    Raises ``PermissionError`` when ``actor`` may not pass this card and
+    ``ValueError`` for malformed input. ``env`` defaults to ``os.environ``
+    and is only consulted for ``HERMES_KANBAN_TASK``: a call made from
+    inside a kanban worker run (for any card) is refused unless that run
+    belongs to an Orda profile, so a builder's worker cannot shell out to
+    ``hermes -p orda kanban orda-pass`` from its own run.
+    """
+    actor_norm = _normalize_profile(actor)
+    allowed = orda_profiles()
+    if not actor_norm or actor_norm not in allowed:
+        raise PermissionError(
+            f"{actor!r} is not an Orda profile (kanban.orda_profiles={allowed}); "
+            "only Orda may record an Orda PASS"
+        )
+    sha_norm = normalize_sha(sha)
+    if sha_norm is None:
+        raise ValueError(
+            f"sha must be a full 40 or 64 character hex commit id, got {sha!r}"
+        )
+    receipt = str(receipt_id or "").strip()
+    if not receipt:
+        raise ValueError("receipt_id is required")
+    if len(receipt) > _RECEIPT_ID_MAX_LEN:
+        raise ValueError(
+            f"receipt_id is longer than {_RECEIPT_ID_MAX_LEN} characters"
+        )
+    env = os.environ if env is None else env
+    worker_task = (env.get("HERMES_KANBAN_TASK") or "").strip()
+    with write_txn(conn):
+        if not conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone():
+            raise ValueError(f"unknown task {task_id}")
+        builders = card_builder_profiles(conn, task_id)
+        if actor_norm in builders:
+            raise PermissionError(
+                f"{actor_norm!r} built {task_id} (builders: {sorted(builders)}) "
+                "and cannot pass it"
+            )
+        if worker_task:
+            found, run_profile = _current_worker_run_profile(conn, worker_task)
+            if not found or run_profile not in allowed:
+                raise PermissionError(
+                    "refusing to record an Orda PASS from inside kanban worker "
+                    f"run for {worker_task} (run profile: {run_profile or 'unknown'}); "
+                    "only an Orda review run or an Orda operator shell may pass"
+                )
+        payload = {
+            "schema": ORDA_PASS_SCHEMA,
+            "verdict": "PASS",
+            "sha": sha_norm,
+            "receipt_id": receipt,
+            "reviewer": actor_norm,
+        }
+        _append_event(conn, task_id, ORDA_PASS_EVENT, payload)
+    return payload
+
+
+def find_orda_pass(
+    conn: sqlite3.Connection, task_id: str, sha: str,
+) -> Optional[dict]:
+    """Return the newest valid Orda PASS payload for exactly ``sha``.
+
+    A recorded pass only counts when its reviewer is still an Orda profile
+    and is not (now) one of the card's builders.
+    """
+    sha_norm = normalize_sha(sha)
+    if sha_norm is None:
+        return None
+    allowed = set(orda_profiles())
+    builders = card_builder_profiles(conn, task_id)
+    for ev in conn.execute(
+        "SELECT id, payload, created_at FROM task_events "
+        "WHERE task_id = ? AND kind = ? ORDER BY id DESC",
+        (task_id, ORDA_PASS_EVENT),
+    ):
+        payload = _load_event_payload(ev["payload"])
+        if payload.get("verdict") != "PASS":
+            continue
+        if normalize_sha(payload.get("sha")) != sha_norm:
+            continue
+        reviewer = _normalize_profile(payload.get("reviewer"))
+        if not reviewer or reviewer not in allowed or reviewer in builders:
+            continue
+        if not str(payload.get("receipt_id") or "").strip():
+            continue
+        return {**payload, "event_id": int(ev["id"]),
+                "recorded_at": int(ev["created_at"])}
+    return None
+
+
+def check_ship_allowed(
+    conn: sqlite3.Connection, task_id: str, sha: Optional[str],
+) -> tuple[bool, str, Optional[dict]]:
+    """Gate for merge, deploy, and review approval of ``task_id`` at ``sha``.
+
+    Returns ``(ok, reason, orda_pass_payload)``. Merge and deploy scripts
+    should call this (or ``hermes kanban ship-gate``) with the exact head
+    sha they are about to ship and refuse on ``ok is False``.
+    """
+    if not conn.execute(
+        "SELECT 1 FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone():
+        return False, f"unknown task {task_id}", None
+    if sha is None or not str(sha).strip():
+        return False, "no head sha supplied (pass head_sha / --sha)", None
+    sha_norm = normalize_sha(sha)
+    if sha_norm is None:
+        return False, f"head sha {sha!r} is not a full hex commit id", None
+    found = find_orda_pass(conn, task_id, sha_norm)
+    if found is None:
+        return False, f"no Orda PASS recorded for sha {sha_norm}", None
+    return True, "ok", found
+
+
+def _workspace_head_sha(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Best-effort ``git rev-parse HEAD`` of a worktree task's workspace."""
+    row = conn.execute(
+        "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None or row["workspace_kind"] != "worktree":
+        return None
+    path = row["workspace_path"]
+    if not path or not Path(path).is_dir():
+        return None
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    return normalize_sha(proc.stdout.strip())
+
+
+def _is_review_lane_completion(conn: sqlite3.Connection, task_id: str) -> bool:
+    row = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    if row["status"] == "review":
+        return True
+    if row["status"] == "running":
+        return _retry_status_for_run(conn, task_id) == "review"
+    return False
+
+
+def _enforce_orda_gate_for_completion(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    head_sha: Optional[str],
+    metadata: Optional[dict],
+) -> Optional[dict]:
+    """Refuse a review-lane completion that lacks a matching Orda PASS.
+
+    Returns the matched pass payload (or ``None`` when the gate does not
+    apply). Raises :class:`OrdaPassRequiredError` after recording a
+    ``ship_blocked_orda_gate`` event when it refuses.
+    """
+    if not orda_gate_enabled() or not _is_review_lane_completion(conn, task_id):
+        return None
+    sha = head_sha
+    if sha is None and isinstance(metadata, dict):
+        sha = metadata.get("head_sha")
+    ok, reason, found = check_ship_allowed(conn, task_id, sha)
+    if ok:
+        workspace_head = _workspace_head_sha(conn, task_id)
+        if workspace_head is not None and workspace_head != normalize_sha(sha):
+            ok = False
+            reason = (
+                f"workspace HEAD {workspace_head} does not match head sha "
+                f"{normalize_sha(sha)}"
+            )
+    if ok:
+        return found
+    with write_txn(conn):
+        _append_event(
+            conn, task_id, ORDA_GATE_BLOCKED_EVENT,
+            {"reason": reason, "head_sha": sha if isinstance(sha, str) else None,
+             "action": "complete"},
+        )
+    raise OrdaPassRequiredError(task_id, reason)
 
 
 # ---------------------------------------------------------------------------

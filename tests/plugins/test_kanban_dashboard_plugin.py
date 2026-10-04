@@ -310,7 +310,10 @@ def test_reopening_parent_demotes_ready_child(client):
     assert child_after_reopen["status"] == "todo"
 
 
-def test_reopening_parent_retracts_review_and_blocks_approval(client):
+def test_reopening_parent_retracts_review_and_blocks_approval(client, monkeypatch):
+    # Parent gating is under test here; the Orda PASS gate (t_159b0030)
+    # is covered in tests/hermes_cli/test_kanban_review_guard.py.
+    monkeypatch.setattr(kb, "orda_gate_enabled", lambda: False)
     with kb.connect() as conn:
         parent_id = kb.create_task(conn, title="parent", assignee="planner")
         assert kb.complete_task(conn, parent_id)
@@ -1232,3 +1235,44 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+
+
+def test_dashboard_review_approval_requires_orda_pass(client):
+    """t_159b0030: dragging a review card to done needs an Orda PASS for
+    the exact head sha; the dashboard reports the refusal as 409 (PATCH)
+    or a per-task error (bulk) and leaves the card in review."""
+    sha = "c" * 40
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ship me", assignee="kublai")
+        run = kb.claim_task(conn, tid)
+        assert kb.request_review(
+            conn, tid, summary="built", reviewer="orda",
+            expected_run_id=run.current_run_id,
+        )
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{tid}",
+        json={"status": "done", "metadata": {"head_sha": sha}},
+    )
+    assert r.status_code == 409
+    assert "Orda PASS" in r.json()["detail"]
+
+    r = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [tid], "status": "done"},
+    )
+    assert r.status_code == 200
+    (entry,) = r.json()["results"]
+    assert entry["ok"] is False and "Orda PASS" in entry["error"]
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "review"
+        kb.record_orda_pass(conn, tid, sha=sha, receipt_id="rcpt",
+                            actor="orda", env={})
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{tid}",
+        json={"status": "done", "metadata": {"head_sha": sha}},
+    )
+    assert r.status_code == 200, r.text
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "done"

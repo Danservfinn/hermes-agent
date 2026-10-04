@@ -689,6 +689,30 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "reason", nargs="+", help="Concrete changes required before re-review",
     )
 
+    p_orda_pass = sub.add_parser(
+        "orda-pass",
+        help="Record an Orda PASS for the exact head sha of a task "
+             "(Orda profiles only; t_159b0030)",
+    )
+    p_orda_pass.add_argument("task_id")
+    p_orda_pass.add_argument("--sha", required=True,
+                             help="Full head commit sha that Orda tested")
+    p_orda_pass.add_argument("--receipt", required=True, dest="receipt_id",
+                             help="Orda test receipt id")
+    p_orda_pass.add_argument("--json", action="store_true",
+                             help="Emit JSON output")
+
+    p_ship_gate = sub.add_parser(
+        "ship-gate",
+        help="Exit 0 only if an Orda PASS exists for TASK at exactly --sha. "
+             "Call before any merge or deploy (t_159b0030)",
+    )
+    p_ship_gate.add_argument("task_id")
+    p_ship_gate.add_argument("--sha", required=True,
+                             help="Full head commit sha about to be shipped")
+    p_ship_gate.add_argument("--json", action="store_true",
+                             help="Emit JSON output")
+
     p_reopen_review = sub.add_parser(
         "reopen-review",
         help="Send one or more review tasks back for changes (review -> ready/todo)",
@@ -1132,6 +1156,8 @@ def kanban_command(args: argparse.Namespace) -> int:
             "unblock":  _cmd_unblock,
             "request-review": _cmd_request_review,
             "request-changes": _cmd_request_changes,
+            "orda-pass": _cmd_orda_pass,
+            "ship-gate": _cmd_ship_gate,
             "reopen-review":  _cmd_reopen_review,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
@@ -1198,6 +1224,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "block",
     "schedule",
     "unblock",
+    "orda-pass",
     "promote",
     "archive",
     "dispatch",
@@ -2490,6 +2517,70 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
             + (f"; routed to {detail}" if detail else "")
         )
     return 0
+
+
+def _orda_actor() -> str:
+    """Profile identity for ``orda-pass``.
+
+    Uses the active profile (resolved from HERMES_HOME), not the
+    HERMES_PROFILE environment variable, so a caller cannot claim to be
+    Orda by exporting one variable.
+    """
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        name = get_active_profile_name()
+        if name:
+            return name
+    except Exception:
+        pass
+    return "user"
+
+
+def _cmd_orda_pass(args: argparse.Namespace) -> int:
+    actor = _orda_actor()
+    with kb.connect_closing() as conn:
+        try:
+            payload = kb.record_orda_pass(
+                conn, args.task_id,
+                sha=args.sha, receipt_id=args.receipt_id, actor=actor,
+            )
+        except PermissionError as exc:
+            print(f"kanban orda-pass: refused: {exc}", file=sys.stderr)
+            return 1
+    if getattr(args, "json", False):
+        print(json.dumps({"task_id": args.task_id, **payload}, indent=2))
+    else:
+        print(
+            f"Recorded Orda PASS on {args.task_id} for {payload['sha']} "
+            f"(receipt {payload['receipt_id']}, by {payload['reviewer']})"
+        )
+    return 0
+
+
+def _cmd_ship_gate(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        ok, reason, found = kb.check_ship_allowed(conn, args.task_id, args.sha)
+        if not ok and kb.get_task(conn, args.task_id) is not None:
+            # Audit the refused ship attempt on the card itself.
+            with kb.write_txn(conn):
+                kb._append_event(
+                    conn, args.task_id, kb.ORDA_GATE_BLOCKED_EVENT,
+                    {"reason": reason, "head_sha": args.sha,
+                     "action": "ship-gate"},
+                )
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "task_id": args.task_id, "sha": args.sha, "allowed": ok,
+            "reason": reason, "orda_pass": found,
+        }, indent=2))
+    elif ok:
+        print(
+            f"ship-gate OK: {args.task_id} @ {found['sha']} passed by "
+            f"{found['reviewer']} (receipt {found['receipt_id']})"
+        )
+    else:
+        print(f"ship-gate REFUSED: {args.task_id}: {reason}", file=sys.stderr)
+    return 0 if ok else 1
 
 
 def _cmd_reopen_review(args: argparse.Namespace) -> int:

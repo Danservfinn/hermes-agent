@@ -113,11 +113,19 @@ Approve only when the acceptance criteria are satisfied and the evidence is suff
 ```text
 kanban_complete(
     summary="Reviewed and approved. <what was verified>",
-    metadata={"review_outcome": "approved", "reviewer_checks": [...]}
+    metadata={
+        "review_outcome": "approved",
+        "reviewer_checks": [...],
+        "head_sha": "<full 40-char sha of the exact commit approved>",
+    }
 )
 ```
 
 Include the exact checks that passed and any bounded caveat that does not block acceptance.
+
+Review approval is gated on an Orda PASS for the exact head sha. `kanban_complete` from the review lane is refused unless the card carries an `orda_pass` event whose `sha` equals `metadata.head_sha` (and, for worktree tasks, the workspace HEAD). Only an Orda profile can record one, with `hermes kanban orda-pass <task-id> --sha <sha> --receipt <receipt-id>`; a profile that built the card can never record or use one. If the gate refuses, do not retry with another sha and do not work around it: leave a `kanban_comment` asking for Orda review and stop.
+
+Never merge or deploy as part of a review. If a later step ships the change, it must first run `hermes kanban ship-gate <task-id> --sha <sha>` and abort on a non-zero exit.
 
 #### Request changes
 

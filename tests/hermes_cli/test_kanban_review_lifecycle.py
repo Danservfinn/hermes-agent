@@ -28,6 +28,13 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
+@pytest.fixture(autouse=True)
+def _orda_gate_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests cover the generic review lifecycle. The Orda PASS ship
+    gate (t_159b0030) is exercised in test_kanban_review_guard.py."""
+    monkeypatch.setattr(kb, "orda_gate_enabled", lambda: False)
+
+
 @pytest.fixture
 def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Isolated HERMES_HOME with an empty kanban DB."""

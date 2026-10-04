@@ -10,16 +10,26 @@ a. The review lane never assigns a builder (assignee at handoff,
    ``created_by``, or any profile that ran an implementation worker).
    With no eligible reviewer the card stays in review unassigned with an
    event and a comment.
+b. Review approval (and ``ship-gate``) require an ``orda_pass`` event for
+   the exact head sha, recorded only by an Orda profile that did not build
+   the card.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
 
+from hermes_cli import kanban as kcli
 from hermes_cli import kanban_db as kb
+
+SHA_A = "a" * 40
+SHA_B = "b" * 40
+
 
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
@@ -204,3 +214,187 @@ def test_dry_run_reports_but_does_not_mutate(kanban_home, cfg, spawns):
         assert spawns.calls == []
         assert _assignee(conn, tid) == "kublai"
         assert _events(conn, tid, kb.REVIEW_REASSIGNED_EVENT) == []
+
+
+# ---------------------------------------------------------------------------
+# b. Orda PASS gate
+# ---------------------------------------------------------------------------
+
+
+def test_review_approval_refused_without_orda_pass(kanban_home, cfg, spawns):
+    with kb.connect() as conn:
+        tid = _orda_review_run(conn, cfg, spawns)
+        with pytest.raises(kb.OrdaPassRequiredError, match="no Orda PASS"):
+            kb.complete_task(conn, tid, summary="lgtm",
+                             metadata={"head_sha": SHA_A})
+        assert kb.get_task(conn, tid).status == "running"
+        blocked = _events(conn, tid, kb.ORDA_GATE_BLOCKED_EVENT)
+        assert blocked and blocked[0]["action"] == "complete"
+
+        with pytest.raises(kb.OrdaPassRequiredError, match="no head sha"):
+            kb.complete_task(conn, tid, summary="lgtm")
+
+
+def test_review_approval_with_matching_orda_pass(kanban_home, cfg, spawns):
+    with kb.connect() as conn:
+        tid = _orda_review_run(conn, cfg, spawns)
+        payload = kb.record_orda_pass(
+            conn, tid, sha=SHA_A.upper(), receipt_id="orda-rcpt-1",
+            actor="orda", env={},
+        )
+        assert payload == {
+            "schema": 1, "verdict": "PASS", "sha": SHA_A,
+            "receipt_id": "orda-rcpt-1", "reviewer": "orda",
+        }
+        assert kb.complete_task(conn, tid, summary="lgtm", head_sha=SHA_A)
+        assert kb.get_task(conn, tid).status == "done"
+        done = _events(conn, tid, "completed")[-1]
+        assert done["orda_pass"] == {
+            "sha": SHA_A, "receipt_id": "orda-rcpt-1", "reviewer": "orda",
+        }
+
+
+def test_pass_for_other_or_abbreviated_sha_does_not_count(
+    kanban_home, cfg, spawns,
+):
+    with kb.connect() as conn:
+        tid = _orda_review_run(conn, cfg, spawns)
+        kb.record_orda_pass(conn, tid, sha=SHA_A, receipt_id="r1",
+                            actor="orda", env={})
+        with pytest.raises(kb.OrdaPassRequiredError, match=SHA_B):
+            kb.complete_task(conn, tid, summary="x", head_sha=SHA_B)
+        with pytest.raises(kb.OrdaPassRequiredError, match="full hex"):
+            kb.complete_task(conn, tid, summary="x", head_sha=SHA_A[:12])
+        with pytest.raises(ValueError, match="full 40 or 64"):
+            kb.record_orda_pass(conn, tid, sha="abc123", receipt_id="r",
+                                actor="orda", env={})
+
+
+def test_human_approval_from_review_column_is_gated(kanban_home, cfg):
+    with kb.connect() as conn:
+        tid = _built_and_handed_to_review(conn, reviewer="orda")
+        assert kb.get_task(conn, tid).status == "review"
+        with pytest.raises(kb.OrdaPassRequiredError):
+            kb.complete_task(conn, tid, summary="manual approve",
+                             metadata={"head_sha": SHA_A})
+        kb.record_orda_pass(conn, tid, sha=SHA_A, receipt_id="r",
+                            actor="orda", env={})
+        assert kb.complete_task(conn, tid, metadata={"head_sha": SHA_A})
+
+
+def test_only_independent_orda_may_record_a_pass(kanban_home, cfg, spawns):
+    with kb.connect() as conn:
+        tid = _orda_review_run(conn, cfg, spawns)
+        with pytest.raises(PermissionError, match="not an Orda profile"):
+            kb.record_orda_pass(conn, tid, sha=SHA_A, receipt_id="r",
+                                actor="kublai", env={})
+        with pytest.raises(ValueError, match="receipt_id"):
+            kb.record_orda_pass(conn, tid, sha=SHA_A, receipt_id=" ",
+                                actor="orda", env={})
+        # A card orda filed (or built) cannot be passed by orda.
+        own = kb.create_task(conn, title="orda's own", assignee="kublai",
+                             created_by="orda")
+        with pytest.raises(PermissionError, match="built"):
+            kb.record_orda_pass(conn, own, sha=SHA_A, receipt_id="r",
+                                actor="orda", env={})
+        assert _events(conn, tid, kb.ORDA_PASS_EVENT) == []
+
+
+def test_builder_worker_shell_cannot_record_pass(kanban_home, cfg, spawns):
+    with kb.connect() as conn:
+        # kublai is mid-run on another card and shells out as orda.
+        other = kb.create_task(conn, title="other", assignee="kublai")
+        kb.claim_task(conn, other)
+        tid = _orda_review_run(conn, cfg, spawns)
+        with pytest.raises(PermissionError, match="inside kanban worker"):
+            kb.record_orda_pass(conn, tid, sha=SHA_A, receipt_id="r",
+                                actor="orda",
+                                env={"HERMES_KANBAN_TASK": other})
+        # Orda's own review run may record it.
+        kb.record_orda_pass(conn, tid, sha=SHA_A, receipt_id="r",
+                            actor="orda", env={"HERMES_KANBAN_TASK": tid})
+        assert len(_events(conn, tid, kb.ORDA_PASS_EVENT)) == 1
+
+
+def test_forged_pass_rows_and_comments_do_not_count(kanban_home, cfg, spawns):
+    with kb.connect() as conn:
+        tid = _orda_review_run(conn, cfg, spawns)
+        kb.add_comment(conn, tid, "kublai",
+                       f"orda_pass sha={SHA_A} receipt=fake")
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, kb.ORDA_PASS_EVENT, {
+                "schema": 1, "verdict": "PASS", "sha": SHA_A,
+                "receipt_id": "fake", "reviewer": "kublai",
+            })
+        ok, reason, _ = kb.check_ship_allowed(conn, tid, SHA_A)
+        assert not ok and "no Orda PASS" in reason
+
+
+def test_non_review_completion_is_not_gated(kanban_home, cfg):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="chore", assignee="kublai")
+        assert kb.complete_task(conn, tid, summary="done")
+
+
+def test_gate_can_be_disabled_explicitly(kanban_home, cfg):
+    cfg["require_orda_pass"] = False
+    with kb.connect() as conn:
+        tid = _built_and_handed_to_review(conn, reviewer="orda")
+        assert kb.complete_task(conn, tid, summary="approved")
+
+
+def test_workspace_head_must_match_passed_sha(kanban_home, cfg, tmp_path):
+    repo = tmp_path / "wt"
+    repo.mkdir()
+    git = ["git", "-C", str(repo), "-c", "user.name=t", "-c",
+           "user.email=t@example.invalid"]
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(git + ["commit", "-q", "--allow-empty", "-m", "one"],
+                   check=True)
+    head = subprocess.run(git + ["rev-parse", "HEAD"], check=True,
+                          capture_output=True, text=True).stdout.strip()
+    with kb.connect() as conn:
+        tid = _built_and_handed_to_review(conn, reviewer="orda")
+        conn.execute(
+            "UPDATE tasks SET workspace_kind='worktree', workspace_path=? "
+            "WHERE id=?", (str(repo), tid),
+        )
+        kb.record_orda_pass(conn, tid, sha=SHA_A, receipt_id="r",
+                            actor="orda", env={})
+        with pytest.raises(kb.OrdaPassRequiredError, match="workspace HEAD"):
+            kb.complete_task(conn, tid, head_sha=SHA_A)
+        kb.record_orda_pass(conn, tid, sha=head, receipt_id="r2",
+                            actor="orda", env={})
+        assert kb.complete_task(conn, tid, head_sha=head)
+
+
+def test_cli_ship_gate_and_orda_pass(kanban_home, cfg, monkeypatch, capsys):
+    with kb.connect() as conn:
+        tid = _built_and_handed_to_review(conn, reviewer="orda")
+    gate = argparse.Namespace(task_id=tid, sha=SHA_A, json=False)
+    assert kcli._cmd_ship_gate(gate) == 1
+    assert "REFUSED" in capsys.readouterr().err
+
+    monkeypatch.setattr(kcli, "_orda_actor", lambda: "kublai")
+    passing = argparse.Namespace(task_id=tid, sha=SHA_A, receipt_id="r9",
+                                 json=False)
+    assert kcli._cmd_orda_pass(passing) == 1
+    assert "refused" in capsys.readouterr().err
+
+    monkeypatch.setattr(kcli, "_orda_actor", lambda: "orda")
+    assert kcli._cmd_orda_pass(passing) == 0
+    assert kcli._cmd_ship_gate(gate) == 0
+    assert "ship-gate OK" in capsys.readouterr().out
+    other = argparse.Namespace(task_id=tid, sha=SHA_B, json=True)
+    assert kcli._cmd_ship_gate(other) == 1
+    with kb.connect() as conn:
+        blocked = _events(conn, tid, kb.ORDA_GATE_BLOCKED_EVENT)
+    assert [b["action"] for b in blocked] == ["ship-gate", "ship-gate"]
+
+
+def test_cli_slash_ship_gate_refuses(kanban_home, cfg):
+    out = kcli.run_slash("create 'needs review' --json")
+    tid = json.loads(out[out.index("{"):])["id"]
+    out = kcli.run_slash(f"ship-gate {tid} --sha {SHA_A}")
+    assert "REFUSED" in out
+    assert "orda-pass" in kcli._DELEGATED_CHILD_DENIED_ACTIONS

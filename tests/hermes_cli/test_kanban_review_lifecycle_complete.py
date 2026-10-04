@@ -20,6 +20,13 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_diagnostics as kd
 
 
+@pytest.fixture(autouse=True)
+def _orda_gate_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests cover the generic review lifecycle. The Orda PASS ship
+    gate (t_159b0030) is exercised in test_kanban_review_guard.py."""
+    monkeypatch.setattr(kb, "orda_gate_enabled", lambda: False)
+
+
 @pytest.fixture
 def conn(tmp_path: Path):
     db = kb.connect(tmp_path / "kanban.db")
