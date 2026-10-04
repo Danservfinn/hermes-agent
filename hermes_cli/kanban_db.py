@@ -8066,6 +8066,18 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A card sent back for review fixes may respawn at most this many times
+# inside the active-PR window. The 4th is refused.
+_RESPAWN_GUARD_REVIEW_FIX_MAX = 3
+
+# Injected into the respawned worker's prompt and worker context. The
+# exemption exists so the implementer can patch the open PR. It is not
+# permission to merge or deploy.
+_REVIEW_FIX_SPAWN_NOTE = (
+    "Review-fix respawn. Patch the open PR and request review again. "
+    "Do not merge. Do not deploy."
+)
+
 
 @dataclass
 class DispatchResult:
@@ -8117,7 +8129,8 @@ class DispatchResult:
 
     Reasons: ``"blocker_auth"`` (quota/auth error — also auto-blocked),
     ``"recent_success"`` (completed run within guard window),
-    ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    ``"active_pr"`` (GitHub PR URL in a recent comment),
+    ``"review_fix_cap"`` (reopened card already respawned 3 times in 24h)."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
@@ -9453,6 +9466,147 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
+def _latest_review_handoff(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[sqlite3.Row]:
+    """Latest review handoff event, or None.
+
+    ``review_requested`` is included so a later handoff back to review
+    hides an older reopen. The card is currently sent back for fixes
+    only when this row's kind is ``review_reopened`` or
+    ``changes_requested``.
+    """
+    return conn.execute(
+        "SELECT kind, created_at FROM task_events "
+        "WHERE task_id = ? AND kind IN "
+        "('review_reopened', 'changes_requested', 'review_requested') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+
+
+def _reopened_for_review_fix(conn: sqlite3.Connection, task_id: str) -> bool:
+    row = _latest_review_handoff(conn, task_id)
+    return bool(row) and row["kind"] in ("review_reopened", "changes_requested")
+
+
+def _latest_ended_at(conn: sqlite3.Connection, task_id: str) -> int:
+    row = conn.execute(
+        "SELECT ended_at FROM task_runs "
+        "WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY ended_at DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if not row or row["ended_at"] is None:
+        return 0
+    return int(row["ended_at"])
+
+
+def _has_new_review_comment(
+    conn: sqlite3.Connection, task_id: str, *, since: int,
+) -> bool:
+    """True when review feedback landed after ``since`` and is unconsumed.
+
+    A review comment is a task comment whose author is not the current
+    assignee. The assignee's own PR-link comment must not unlock a
+    respawn. ``changes_requested`` is the structured review comment for
+    the autonomous path: it counts until a later run or spawn consumes it,
+    because that event closes the review run and can share its timestamp.
+    """
+    assignee_row = conn.execute(
+        "SELECT assignee FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    assignee = ""
+    if assignee_row and assignee_row["assignee"]:
+        assignee = str(assignee_row["assignee"]).strip().casefold()
+    for comment in conn.execute(
+        "SELECT author FROM task_comments "
+        "WHERE task_id = ? AND created_at > ?",
+        (task_id, int(since)),
+    ):
+        author = (comment["author"] or "").strip().casefold()
+        if author and author != assignee:
+            return True
+
+    handoff = _latest_review_handoff(conn, task_id)
+    if handoff is None or handoff["kind"] != "changes_requested":
+        return False
+    feedback_at = int(handoff["created_at"])
+    consumed = conn.execute(
+        "SELECT 1 FROM task_events "
+        "WHERE task_id = ? AND kind = 'spawned' AND created_at > ? "
+        "LIMIT 1",
+        (task_id, feedback_at),
+    ).fetchone()
+    if consumed:
+        return False
+    later_run = conn.execute(
+        "SELECT 1 FROM task_runs "
+        "WHERE task_id = ? AND ended_at IS NOT NULL AND ended_at > ? "
+        "LIMIT 1",
+        (task_id, feedback_at),
+    ).fetchone()
+    return later_run is None
+
+
+def _review_fix_respawn_count(
+    conn: sqlite3.Connection, task_id: str, now: int,
+) -> int:
+    """Spawns in the PR window that happened after the card was first sent back."""
+    cutoff = int(now) - _RESPAWN_GUARD_PR_WINDOW
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM task_events "
+        "WHERE task_id = ? AND kind = 'spawned' AND created_at >= ? "
+        "AND created_at >= ("
+        "  SELECT MIN(created_at) FROM task_events "
+        "  WHERE task_id = ? "
+        "    AND kind IN ('review_reopened', 'changes_requested')"
+        ")",
+        (task_id, cutoff, task_id),
+    ).fetchone()
+    return int(row["n"] if row and row["n"] is not None else 0)
+
+
+def _active_pr_review_fix_decision(
+    conn: sqlite3.Connection, task_id: str, now: int,
+) -> Optional[str]:
+    """Guard reason for a card that already has an open-PR comment.
+
+    ``None`` means the ready lane may respawn it. Cards that were not
+    sent back for review fixes stay on ``active_pr``.
+    """
+    if not _reopened_for_review_fix(conn, task_id):
+        return "active_pr"
+    if not _has_new_review_comment(
+        conn, task_id, since=_latest_ended_at(conn, task_id),
+    ):
+        return "active_pr"
+    if _review_fix_respawn_count(conn, task_id, now) >= _RESPAWN_GUARD_REVIEW_FIX_MAX:
+        return "review_fix_cap"
+    return None
+
+
+def review_fix_spawn_note(
+    conn: sqlite3.Connection, task_id: str, *, now: Optional[int] = None,
+) -> Optional[str]:
+    """Constraint text for a reopened card that still has an open PR.
+
+    Returned to the worker even when this tick's guard refuses the spawn,
+    so a manual claim cannot treat the exemption as merge permission.
+    """
+    if not _reopened_for_review_fix(conn, task_id):
+        return None
+    current = int(time.time()) if now is None else int(now)
+    pr_cutoff = current - _RESPAWN_GUARD_PR_WINDOW
+    for comment in conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        (task_id, pr_cutoff),
+    ):
+        if comment["body"] and _RESPAWN_GUARD_PR_URL_RE.search(comment["body"]):
+            return _REVIEW_FIX_SPAWN_NOTE
+    return None
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -9505,6 +9659,16 @@ def check_respawn_guard(
         A GitHub PR URL appears in a recent task comment (within
         ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
         opened a PR; re-spawning risks a duplicate PR on the same task.
+        Exempt when the card was sent back for review fixes
+        (latest handoff is ``review_reopened`` or ``changes_requested``),
+        a new review comment has landed since the last ended run, and
+        fewer than ``_RESPAWN_GUARD_REVIEW_FIX_MAX`` review-fix spawns
+        have happened in the window. The exempted respawn may only patch
+        that PR and request review again.
+
+    ``"review_fix_cap"``
+        The card would otherwise be exempt, but it already respawned
+        ``_RESPAWN_GUARD_REVIEW_FIX_MAX`` times in the PR window.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -9592,14 +9756,16 @@ def check_respawn_guard(
         if not requeued_after:
             return "recent_success"
 
-    # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    # 4. GitHub PR URL in a recent comment. A prior worker already opened
+    #    a PR. Re-spawning risks a duplicate, unless the card was sent
+    #    back for review fixes and a new review comment is waiting.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
         "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            return "active_pr"
+            return _active_pr_review_fix_decision(conn, task_id, now)
 
     return None
 
@@ -11024,6 +11190,13 @@ def _dispatch_once_locked(
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        # Review-fix exemption: the worker may patch the open PR and
+        # request review again. It must not merge or deploy. The note is
+        # spawn-only. It is not a Task column: asdict() feeds the dashboard
+        # and must not grow a persisted field for one tick.
+        review_fix_note = review_fix_spawn_note(conn, claimed.id)
+        if review_fix_note:
+            setattr(claimed, "review_fix_note", review_fix_note)
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
@@ -11535,6 +11708,9 @@ def _default_spawn(
     profile_arg = normalize_profile_name(task.assignee)
 
     prompt = f"work kanban task {task.id}"
+    review_fix_note = getattr(task, "review_fix_note", None)
+    if review_fix_note:
+        prompt = f"{prompt}. {review_fix_note}"
     env = dict(os.environ)
     # The dispatcher is detached from every conversation. Its worker must never
     # inherit routing mirrored by a previous gateway turn, even before the first
@@ -11864,6 +12040,12 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     if task.branch_name:
         lines.append(f"Branch:   {task.branch_name}")
     lines.append("")
+
+    review_fix_note = review_fix_spawn_note(conn, task_id, now=_now)
+    if review_fix_note:
+        lines.append("## Review-fix limit")
+        lines.append(review_fix_note)
+        lines.append("")
 
     if task.body and task.body.strip():
         lines.append("## Body")

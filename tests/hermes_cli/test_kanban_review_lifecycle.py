@@ -21,6 +21,8 @@ down:
 from __future__ import annotations
 
 import json
+import os
+import time
 from pathlib import Path
 
 import pytest
@@ -483,6 +485,250 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         assert kb.check_respawn_guard(
             conn, review_id, lane="review"
         ) == "rate_limit_cooldown"
+
+
+_PR_URL = "https://github.com/example/repo/pull/42"
+
+
+def _backdate_implementer_run(conn, tid: str) -> int:
+    """Move the implementer run and its PR comment before wall-clock now.
+
+    Review comments added after this call are strictly newer than the last
+    ended run, independent of same-second clock resolution.
+    """
+    now = int(time.time())
+    conn.execute(
+        "UPDATE task_runs SET ended_at = ? WHERE task_id = ?",
+        (now - 120, tid),
+    )
+    conn.execute(
+        "UPDATE task_comments SET created_at = ? "
+        "WHERE task_id = ? AND author = 'worker'",
+        (now - 100, tid),
+    )
+    conn.execute(
+        "UPDATE task_events SET created_at = ? "
+        "WHERE task_id = ? AND kind = 'review_reopened'",
+        (now - 40, tid),
+    )
+    conn.commit()
+    return now
+
+
+def _reopened_pr_card(conn, *, review_comment: str | None) -> str:
+    tid = kb.create_task(conn, title="patch the open pr", assignee="worker")
+    claimed = kb.claim_task(conn, tid)
+    assert claimed is not None
+    kb.add_comment(conn, tid, "worker", f"Opened {_PR_URL}")
+    assert kb.request_review(
+        conn,
+        tid,
+        summary="PR ready",
+        reviewer="reviewer",
+        expected_run_id=claimed.current_run_id,
+    )
+    assert kb.reopen_review_task(conn, tid)
+    _backdate_implementer_run(conn, tid)
+    # The assignee echoing the review must not count as a new review comment.
+    kb.add_comment(conn, tid, "worker", "CHANGES REQUESTED: see reviewer")
+    if review_comment:
+        kb.add_comment(conn, tid, "reviewer", review_comment)
+    return tid
+
+
+def test_reopened_card_with_new_review_comment_respawns_once(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Open PR plus a reviewer comment after the last run respawns once.
+
+    A second tick with no newer review comment is guarded again. The
+    respawn carries the patch-only limit and must not merge or deploy.
+    """
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    notes: list[str | None] = []
+
+    def spawn(task, workspace):
+        notes.append(getattr(task, "review_fix_note", None))
+        return None
+
+    with kb.connect() as conn:
+        tid = _reopened_pr_card(conn, review_comment="Fix the price-target tables.")
+        assert kb.check_respawn_guard(conn, tid) is None
+        context = kb.build_worker_context(conn, tid)
+        assert "Review-fix limit" in context
+        assert kb._REVIEW_FIX_SPAWN_NOTE in context
+        assert "Do not merge. Do not deploy." in context
+
+        res = kb.dispatch_once(conn, spawn_fn=spawn)
+        assert [item[0] for item in res.spawned].count(tid) == 1
+        assert tid not in dict(res.respawn_guarded)
+        assert notes == [kb._REVIEW_FIX_SPAWN_NOTE]
+
+        later = int(time.time()) + 5
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, outcome, "
+            "started_at, ended_at) VALUES (?, 'worker', 'review', "
+            "'review_requested', ?, ?)",
+            (tid, later, later),
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, current_run_id = NULL "
+            "WHERE id = ?",
+            (tid,),
+        )
+        conn.commit()
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+        again = kb.dispatch_once(conn, dry_run=True)
+        assert tid not in [item[0] for item in again.spawned]
+        assert dict(again.respawn_guarded).get(tid) == "active_pr"
+
+
+def test_reopened_card_without_new_review_comment_stays_guarded(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    with kb.connect() as conn:
+        tid = _reopened_pr_card(conn, review_comment=None)
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+        res = kb.dispatch_once(conn, dry_run=True)
+        assert tid not in [item[0] for item in res.spawned]
+        assert dict(res.respawn_guarded).get(tid) == "active_pr"
+
+
+def test_fourth_review_fix_respawn_inside_24h_is_refused(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    with kb.connect() as conn:
+        tid = _reopened_pr_card(conn, review_comment="One more fix.")
+        now = int(time.time())
+        for offset in range(kb._RESPAWN_GUARD_REVIEW_FIX_MAX):
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                "VALUES (?, 'spawned', '{\"pid\": 1}', ?)",
+                (tid, now - 20 + offset),
+            )
+        conn.commit()
+        assert kb.check_respawn_guard(conn, tid) == "review_fix_cap"
+        res = kb.dispatch_once(conn, dry_run=True)
+        assert tid not in [item[0] for item in res.spawned]
+        assert dict(res.respawn_guarded).get(tid) == "review_fix_cap"
+
+
+def test_active_pr_guard_unchanged_when_card_was_not_reopened(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reviewer comment does not bypass active_pr without a reopen."""
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="already PRed", assignee="worker")
+        kb.add_comment(conn, tid, "worker", f"Opened {_PR_URL}")
+        kb.add_comment(conn, tid, "reviewer", "Looks wrong, but this card was not reopened.")
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+        res = kb.dispatch_once(conn, dry_run=True)
+        assert tid not in [item[0] for item in res.spawned]
+        assert dict(res.respawn_guarded).get(tid) == "active_pr"
+        assert "Review-fix limit" not in kb.build_worker_context(conn, tid)
+
+
+def test_changes_requested_respawns_once_without_a_separate_comment(
+    kanban_home: Path,
+) -> None:
+    """The autonomous changes_requested reason is the review comment.
+
+    It unlocks one respawn. A spawn after that event consumes it.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="autonomous review fix", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        kb.add_comment(conn, tid, "worker", f"Opened {_PR_URL}")
+        assert kb.request_review(
+            conn,
+            tid,
+            summary="PR ready",
+            reviewer="reviewer",
+            expected_run_id=claimed.current_run_id,
+        )
+        review = kb.claim_review_task(conn, tid)
+        assert review is not None
+        ok, implementer = kb.request_changes(
+            conn,
+            tid,
+            reason="Patch the open PR. Do not merge.",
+            expected_run_id=review.current_run_id,
+        )
+        assert ok is True
+        assert implementer == "worker"
+        assert kb.check_respawn_guard(conn, tid) is None
+
+        feedback = conn.execute(
+            "SELECT created_at FROM task_events "
+            "WHERE task_id = ? AND kind = 'changes_requested' "
+            "ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'spawned', '{\"pid\": 9}', ?)",
+            (tid, int(feedback["created_at"]) + 5),
+        )
+        conn.commit()
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_review_fix_spawn_prompt_forbids_merge_and_deploy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    captured: dict[str, list[str]] = {}
+
+    class _Proc:
+        pid = 4242
+
+    def _fake_popen(cmd, **kwargs):
+        captured["cmd"] = list(cmd)
+        return _Proc()
+
+    monkeypatch.setattr("subprocess.Popen", _fake_popen)
+    monkeypatch.setattr(kb, "_retag_legacy_worker_sessions", lambda _root: None)
+    monkeypatch.setattr(kb, "worker_logs_dir", lambda board=None: tmp_path / "logs")
+
+    task = kb.Task(
+        id="t_reviewfix",
+        title="patch pr",
+        body=None,
+        assignee="worker",
+        status="running",
+        priority=0,
+        created_by=None,
+        created_at=0,
+        started_at=None,
+        completed_at=None,
+        workspace_kind="scratch",
+        workspace_path=None,
+        claim_lock=None,
+        claim_expires=None,
+        tenant=None,
+    )
+    setattr(task, "review_fix_note", kb._REVIEW_FIX_SPAWN_NOTE)
+    workspace = tmp_path / "ws"
+    os.makedirs(workspace, exist_ok=True)
+
+    kb._default_spawn(task, str(workspace))
+
+    prompt = captured["cmd"][captured["cmd"].index("-q") + 1]
+    assert "work kanban task t_reviewfix" in prompt
+    assert "Patch the open PR" in prompt
+    assert "Do not merge. Do not deploy." in prompt
 
 
 def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
