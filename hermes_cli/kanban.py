@@ -2687,6 +2687,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
+            "review_reassigned": [
+                {"task_id": tid, "from": old, "to": new}
+                for (tid, old, new) in res.review_reassigned
+            ],
+            "review_no_eligible_reviewer": res.review_no_eligible_reviewer,
         }, indent=2))
         return 0
     print(f"Reclaimed:    {res.reclaimed}")

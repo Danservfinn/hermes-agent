@@ -4775,6 +4775,23 @@ def claim_review_task(
                     },
                 )
             return None
+        # Separation of duties (t_159b0030): a builder of the card must
+        # never hold the review run, whichever path tries to claim it.
+        pending = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ? AND status = 'review' "
+            "AND claim_lock IS NULL",
+            (task_id,),
+        ).fetchone()
+        if pending is not None:
+            reviewer = _normalize_profile(pending["assignee"])
+            builders = card_builder_profiles(conn, task_id)
+            if reviewer is not None and reviewer in builders:
+                _append_event(
+                    conn, task_id, REVIEW_CLAIM_REFUSED_EVENT,
+                    {"assignee": pending["assignee"],
+                     "builders": sorted(builders)},
+                )
+                return None
         cur = conn.execute(
             """
             UPDATE tasks
@@ -8082,6 +8099,14 @@ class DispatchResult:
     spawned. ``None`` when memory was fine/unknown and the guard imposed
     no restriction. Reclaim/promotion bookkeeping still ran either way;
     deferred tasks stay queued for the next tick."""
+    review_reassigned: list[tuple[str, str, str]] = field(default_factory=list)
+    """Review tasks whose assignee was one of the card's builders and was
+    replaced by an eligible reviewer this tick, as
+    ``(task_id, builder, reviewer)`` (t_159b0030)."""
+    review_no_eligible_reviewer: list[str] = field(default_factory=list)
+    """Review tasks whose assignee was a builder and no eligible reviewer
+    exists. They are left in ``review`` with the assignee cleared and a
+    ``review_reviewer_unavailable`` event plus comment (t_159b0030)."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -9611,6 +9636,174 @@ def review_dispatch_enabled() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Review separation of duties (t_159b0030, incident run 9018)
+#
+# The review lane spawns whatever profile sits in ``tasks.assignee`` when a
+# card is in ``review``. ``request_review`` only rewrites the assignee when a
+# reviewer is passed explicitly, so a builder that handed its own card to
+# review was re-spawned as its own reviewer, approved its own work, and
+# shipped it. The helpers below compute the set of profiles that built a
+# card and pick a reviewer from outside that set. When nobody eligible is
+# configured the card stays in ``review`` unassigned with an auditable event
+# and comment; the dispatcher never falls back to the builder.
+# ---------------------------------------------------------------------------
+
+DEFAULT_REVIEWER_PROFILES: tuple[str, ...] = ("orda",)
+REVIEW_REASSIGNED_EVENT = "review_reassigned"
+REVIEWER_UNAVAILABLE_EVENT = "review_reviewer_unavailable"
+REVIEW_CLAIM_REFUSED_EVENT = "review_claim_refused_builder"
+REVIEW_GUARD_AUTHOR = "kanban-review-guard"
+
+
+def _kanban_config_section() -> dict:
+    """Return the ``kanban`` config section, ``{}`` on any read error."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+    except Exception:
+        return {}
+    section = cfg.get("kanban") if isinstance(cfg, dict) else None
+    return section if isinstance(section, dict) else {}
+
+
+def _normalize_profile(name: Any) -> Optional[str]:
+    """Canonical profile id for comparisons, ``None`` for empty values."""
+    if not isinstance(name, str) or not name.strip():
+        return None
+    try:
+        return _canonical_assignee(name)
+    except Exception:
+        return name.strip().lower()
+
+
+def _config_profile_list(key: str, default: Iterable[str]) -> list[str]:
+    """Read an ordered, de-duplicated profile list from ``kanban.<key>``.
+
+    Accepts a YAML list or a comma separated string. A missing key yields
+    ``default``; an explicit empty list yields ``[]``.
+    """
+    raw = _kanban_config_section().get(key, None)
+    if raw is None:
+        values: list[Any] = list(default)
+    elif isinstance(raw, str):
+        values = raw.split(",")
+    elif isinstance(raw, (list, tuple)):
+        values = list(raw)
+    else:
+        values = list(default)
+    out: list[str] = []
+    for value in values:
+        norm = _normalize_profile(value)
+        if norm and norm not in out:
+            out.append(norm)
+    return out
+
+
+def reviewer_profiles() -> list[str]:
+    """Ordered reviewer candidates from ``kanban.reviewer_profiles``.
+
+    Defaults to ``["orda"]``. A candidate is only used when it is not one
+    of the card's builders (see :func:`card_builder_profiles`) and is a
+    real Hermes profile.
+    """
+    return _config_profile_list("reviewer_profiles", DEFAULT_REVIEWER_PROFILES)
+
+
+def _load_event_payload(raw: Any) -> dict:
+    try:
+        payload = json.loads(raw) if raw else {}
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def card_builder_profiles(conn: sqlite3.Connection, task_id: str) -> set[str]:
+    """Return every profile that must never review or pass ``task_id``.
+
+    The set is the union of:
+
+    * ``tasks.created_by`` (the profile that filed the card),
+    * each ``implementer`` recorded on ``review_requested`` and
+      ``changes_requested`` events (the assignee at handoff time),
+    * the profile of every worker run that was claimed from an
+      implementation lane (any ``claimed`` event whose
+      ``source_status`` is not ``review``). Review runs are excluded so
+      the reviewer who requested changes can re-review the fix.
+
+    The current assignee is deliberately not added on its own: after
+    ``request_review(reviewer=...)`` it is the designated reviewer. If it
+    is the builder, it is already in the set via one of the rules above.
+    """
+    builders: set[str] = set()
+    row = conn.execute(
+        "SELECT created_by FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None:
+        return builders
+    creator = _normalize_profile(row["created_by"])
+    if creator:
+        builders.add(creator)
+    for ev in conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? "
+        "AND kind IN ('review_requested', 'changes_requested')",
+        (task_id,),
+    ):
+        implementer = _normalize_profile(
+            _load_event_payload(ev["payload"]).get("implementer")
+        )
+        if implementer:
+            builders.add(implementer)
+    review_run_ids: set[int] = set()
+    impl_run_ids: set[int] = set()
+    for ev in conn.execute(
+        "SELECT run_id, payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'claimed' AND run_id IS NOT NULL",
+        (task_id,),
+    ):
+        if _load_event_payload(ev["payload"]).get("source_status") == "review":
+            review_run_ids.add(int(ev["run_id"]))
+        else:
+            impl_run_ids.add(int(ev["run_id"]))
+    for run in conn.execute(
+        "SELECT id, profile FROM task_runs WHERE task_id = ?", (task_id,),
+    ):
+        run_id = int(run["id"])
+        if run_id in impl_run_ids and run_id not in review_run_ids:
+            prof = _normalize_profile(run["profile"])
+            if prof:
+                builders.add(prof)
+    return builders
+
+
+def select_reviewer(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    candidates: Optional[Iterable[str]] = None,
+) -> tuple[Optional[str], set[str]]:
+    """Pick the first eligible reviewer for ``task_id``.
+
+    Returns ``(reviewer_or_None, builders)``. Candidates default to
+    :func:`reviewer_profiles`; each must be outside the builder set and,
+    when the profiles module is importable, an existing profile.
+    """
+    builders = card_builder_profiles(conn, task_id)
+    pool = list(candidates) if candidates is not None else reviewer_profiles()
+    try:
+        from hermes_cli.profiles import profile_exists as _exists
+    except Exception:
+        _exists = None  # type: ignore[assignment]
+    for cand in pool:
+        norm = _normalize_profile(cand)
+        if not norm or norm in builders:
+            continue
+        if _exists is not None and not _exists(norm):
+            continue
+        return norm, builders
+    return None, builders
+
+
+# ---------------------------------------------------------------------------
 # Memory-aware dispatch guard (OOF-30 / OOF-77)
 #
 # Two production incidents ("larrikin-lollies", "synclare-task-manager")
@@ -9803,6 +9996,89 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         )
     except Exception:
         return "unknown"
+
+
+def _review_lane_assignee(
+    conn: sqlite3.Connection,
+    task_id: str,
+    assignee: str,
+    result: "DispatchResult",
+    *,
+    dry_run: bool = False,
+) -> Optional[str]:
+    """Resolve who may run the review worker for ``task_id`` (t_159b0030).
+
+    Returns the profile to spawn, or ``None`` when the card must not be
+    spawned this tick. If ``assignee`` is not one of the card's builders
+    it is returned unchanged. Otherwise the first eligible candidate from
+    ``kanban.reviewer_profiles`` replaces it (``review_reassigned``
+    event). With no eligible candidate the assignee is cleared, a
+    ``review_reviewer_unavailable`` event and a comment are recorded, and
+    the card stays in ``review`` for a human to route. Dry runs report the
+    decision without writing.
+    """
+    current = _normalize_profile(assignee)
+    reviewer, builders = select_reviewer(conn, task_id)
+    if current and current not in builders:
+        return assignee
+    if reviewer is not None:
+        if not dry_run:
+            with write_txn(conn):
+                cur = conn.execute(
+                    "UPDATE tasks SET assignee = ? WHERE id = ? "
+                    "AND status = 'review' AND claim_lock IS NULL "
+                    "AND assignee = ?",
+                    (reviewer, task_id, assignee),
+                )
+                if cur.rowcount != 1:
+                    return None
+                _append_event(
+                    conn, task_id, REVIEW_REASSIGNED_EVENT,
+                    {
+                        "from": assignee,
+                        "to": reviewer,
+                        "builders": sorted(builders),
+                        "source": "kanban.review_guard",
+                    },
+                )
+        result.review_reassigned.append((task_id, assignee, reviewer))
+        _log.warning(
+            "kanban review guard: task %s assignee %r built the card; "
+            "reviewer reassigned to %r", task_id, assignee, reviewer,
+        )
+        return reviewer
+    result.review_no_eligible_reviewer.append(task_id)
+    _log.warning(
+        "kanban review guard: task %s has no eligible reviewer (builders=%s, "
+        "candidates=%s); leaving it in review unassigned",
+        task_id, sorted(builders), reviewer_profiles(),
+    )
+    if dry_run:
+        return None
+    message = (
+        f"Review guard: {assignee!r} built this card and cannot review it. "
+        f"No eligible reviewer found in kanban.reviewer_profiles="
+        f"{reviewer_profiles()} (excluded builders: {sorted(builders)}). "
+        "Left in review unassigned; assign an independent reviewer."
+    )
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET assignee = NULL WHERE id = ? "
+            "AND status = 'review' AND claim_lock IS NULL AND assignee = ?",
+            (task_id, assignee),
+        )
+        if cur.rowcount != 1:
+            return None
+        _append_event(
+            conn, task_id, REVIEWER_UNAVAILABLE_EVENT,
+            {
+                "builder": assignee,
+                "builders": sorted(builders),
+                "candidates": reviewer_profiles(),
+            },
+        )
+        add_comment(conn, task_id, REVIEW_GUARD_AUTHOR, message)
+    return None
 
 
 def dispatch_once(
@@ -10322,18 +10598,26 @@ def _dispatch_once_locked(
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
+        # Separation of duties (t_159b0030): never spawn one of the card's
+        # builders as its reviewer. Swap in an eligible reviewer, or park
+        # the card unassigned in review when nobody eligible exists.
+        review_assignee = _review_lane_assignee(
+            conn, row["id"], row["assignee"], result, dry_run=dry_run,
+        )
+        if review_assignee is None:
+            continue
         try:
             from hermes_cli.profiles import profile_exists
         except Exception:
             profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
+        if profile_exists is not None and not profile_exists(review_assignee):
             result.skipped_nonspawnable.append(row["id"])
             continue
         if _per_profile_cap is not None:
-            current = _per_profile_running.get(row["assignee"], 0)
+            current = _per_profile_running.get(review_assignee, 0)
             if current >= _per_profile_cap:
                 result.skipped_per_profile_capped.append(
-                    (row["id"], row["assignee"], current)
+                    (row["id"], review_assignee, current)
                 )
                 continue
         guard_reason = check_respawn_guard(conn, row["id"], lane="review")
@@ -10347,11 +10631,11 @@ def _dispatch_once_locked(
                     )
             continue
         if dry_run:
-            result.spawned.append((row["id"], row["assignee"], ""))
+            result.spawned.append((row["id"], review_assignee, ""))
             spawned += 1
             if _per_profile_cap is not None:
-                _per_profile_running[row["assignee"]] = (
-                    _per_profile_running.get(row["assignee"], 0) + 1
+                _per_profile_running[review_assignee] = (
+                    _per_profile_running.get(review_assignee, 0) + 1
                 )
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)

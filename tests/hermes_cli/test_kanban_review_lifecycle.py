@@ -128,7 +128,7 @@ def test_repeated_review_requests_never_triage(kanban_home: Path) -> None:
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="cycle me", assignee="worker")
 
-        for _ in range(4):
+        for cycle in range(4):
             # Executor claims (ready->running or review->running) and finishes
             # with a review request. claim_review_task handles review->running.
             task = kb.get_task(conn, tid)
@@ -144,6 +144,9 @@ def test_repeated_review_requests_never_triage(kanban_home: Path) -> None:
                 conn, tid,
                 summary="pass complete",
                 expected_run_id=run_id,
+                # Separation of duties (t_159b0030): each pass hands to a
+                # reviewer that has not built the card yet.
+                reviewer=f"reviewer{cycle}",
             )
             assert ok is True
             row = _row(conn, tid)

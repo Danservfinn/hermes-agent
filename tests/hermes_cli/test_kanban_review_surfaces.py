@@ -178,6 +178,7 @@ def test_domain_and_cli_review_handoffs_redact_before_persistence(
             summary=f"direct {secret}",
             metadata={"nested": [secret]},
             expected_run_id=direct_run.current_run_id,
+            reviewer="reviewer",
         )
         run = kb.latest_run(conn, direct_id)
         event = [
