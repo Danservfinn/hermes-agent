@@ -5426,6 +5426,11 @@ def complete_task(
     Without a matching ``orda_pass`` event the call raises
     :class:`OrdaPassRequiredError` and the task is not mutated. Disable
     only with ``kanban.require_orda_pass: false``.
+
+    Code cards (worktree workspace or project link, see
+    :func:`code_card_reason`) can only be completed from the review lane;
+    any other completion raises :class:`ReviewRequiredError` without
+    mutating the task (``kanban.code_cards_require_review``).
     """
     now = int(time.time())
     # Fail before validating cards or staging artifacts; re-check inside the
@@ -5460,8 +5465,10 @@ def complete_task(
     else:
         verified_cards = []
 
-    # Gate: review approvals need an Orda PASS for the exact head sha.
-    # Raises before any task mutation (t_159b0030).
+    # Gate: code cards must reach done through review, and review
+    # approvals need an Orda PASS for the exact head sha. Both raise
+    # before any task mutation (t_159b0030).
+    _enforce_review_path_for_code_cards(conn, task_id)
     orda_pass = _enforce_orda_gate_for_completion(
         conn, task_id, head_sha=head_sha, metadata=metadata,
     )
@@ -10123,6 +10130,94 @@ def _enforce_orda_gate_for_completion(
              "action": "complete"},
         )
     raise OrdaPassRequiredError(task_id, reason)
+
+
+# ---------------------------------------------------------------------------
+# Code cards must ship through review (t_159b0030, Temujin ruling on Q3)
+#
+# A code card is one the kernel can recognise as repository work:
+#
+# * ``workspace_kind == 'worktree'`` (the worker runs in a git worktree;
+#   this also covers every ``branch_name``, which is only valid for
+#   worktree tasks), or
+# * ``project_id`` is set (the card is linked to a first-class Project,
+#   whose primary repo anchors its worktree).
+#
+# ``scratch`` and ``dir`` cards without a project link are not code cards
+# and keep the previous behaviour. For a code card, ``complete_task`` from
+# any non-review state (running under an implementation run, ready,
+# blocked) is refused: the card has to go through ``request_review`` and
+# a review approval, which in turn needs an Orda PASS for the exact head
+# sha. ``kanban.code_cards_require_review`` (default true) is the explicit
+# off switch.
+# ---------------------------------------------------------------------------
+
+REVIEW_REQUIRED_BLOCKED_EVENT = "completion_blocked_requires_review"
+
+
+class ReviewRequiredError(ValueError):
+    """Raised when a code card tries to reach ``done`` without review."""
+
+    def __init__(self, task_id: str, reason: str):
+        self.task_id = task_id
+        self.reason = reason
+        super().__init__(
+            f"completion refused for {task_id}: {reason}. Code cards must go "
+            "through review (kanban_request_review / hermes kanban "
+            "request-review), and review approval needs an Orda PASS for "
+            "the exact head sha."
+        )
+
+
+def code_cards_require_review_enabled() -> bool:
+    """Whether code cards must reach ``done`` through review."""
+    raw = _kanban_config_section().get("code_cards_require_review", True)
+    if isinstance(raw, str):
+        return raw.strip().lower() not in {"0", "false", "no", "off"}
+    return bool(raw)
+
+
+def code_card_reason(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Why ``task_id`` counts as a code card, or ``None`` if it does not."""
+    row = conn.execute(
+        "SELECT workspace_kind, project_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    if row["workspace_kind"] == "worktree":
+        return "code card (worktree workspace)"
+    if row["project_id"]:
+        return f"code card (linked to project {row['project_id']})"
+    return None
+
+
+def _enforce_review_path_for_code_cards(
+    conn: sqlite3.Connection, task_id: str,
+) -> None:
+    """Refuse a non-review completion of a code card.
+
+    Only statuses ``complete_task`` could otherwise move to ``done`` are
+    considered, so a call on a task that is already terminal keeps
+    returning ``False`` instead of raising.
+    """
+    if not code_cards_require_review_enabled():
+        return
+    row = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None or row["status"] not in ("running", "ready", "blocked"):
+        return
+    why = code_card_reason(conn, task_id)
+    if why is None or _is_review_lane_completion(conn, task_id):
+        return
+    reason = f"{why} cannot go from {row['status']} straight to done"
+    with write_txn(conn):
+        _append_event(
+            conn, task_id, REVIEW_REQUIRED_BLOCKED_EVENT,
+            {"reason": reason, "status": row["status"]},
+        )
+    raise ReviewRequiredError(task_id, reason)
 
 
 # ---------------------------------------------------------------------------

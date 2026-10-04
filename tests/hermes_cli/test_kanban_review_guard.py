@@ -18,6 +18,10 @@ b. Review approval (and ``ship-gate``) require an ``orda_pass`` event for
    the card.
 c. ``default_assignee`` auto-assign is opt-in and honours
    ``no_auto_assign`` markers and ``auto_assign_skip_creators``.
+d. Code cards (worktree workspace or project link) cannot reach ``done``
+   from any non-review state on any path (kernel, CLI; the agent tool and
+   dashboard are covered in their own test files). Non-code cards keep
+   the old behaviour.
 """
 
 from __future__ import annotations
@@ -516,3 +520,109 @@ def test_cli_create_no_auto_assign_flag(kanban_home, cfg):
     tid = json.loads(out[out.index("{"):])["id"]
     with kb.connect() as conn:
         assert kb.has_no_auto_assign_marker(conn, tid)
+
+
+# ---------------------------------------------------------------------------
+# d. code cards must ship through review
+# ---------------------------------------------------------------------------
+
+
+def _code_card(conn, *, kind="worktree", status_path="running"):
+    tid = kb.create_task(conn, title="code card", assignee="kublai",
+                         created_by="ogedei")
+    if kind == "worktree":
+        # A real worktree path is not needed for the gate; leave it unset so
+        # the workspace HEAD check is skipped and only the rule is tested.
+        conn.execute(
+            "UPDATE tasks SET workspace_kind='worktree', workspace_path=NULL "
+            "WHERE id=?", (tid,),
+        )
+    elif kind == "project":
+        conn.execute("UPDATE tasks SET project_id='proj-hermes' WHERE id=?",
+                     (tid,))
+    elif kind == "dir":
+        conn.execute(
+            "UPDATE tasks SET workspace_kind='dir', workspace_path='/tmp' "
+            "WHERE id=?", (tid,),
+        )
+    if status_path == "running":
+        assert kb.claim_task(conn, tid) is not None
+    elif status_path == "blocked":
+        assert kb.block_task(conn, tid, reason="waiting")
+    return tid
+
+
+@pytest.mark.parametrize("kind", ["worktree", "project"])
+@pytest.mark.parametrize("status_path", ["running", "ready", "blocked"])
+def test_code_card_cannot_skip_review(kanban_home, cfg, kind, status_path):
+    with kb.connect() as conn:
+        tid = _code_card(conn, kind=kind, status_path=status_path)
+        before = kb.get_task(conn, tid).status
+        assert before == status_path
+        with pytest.raises(kb.ReviewRequiredError, match="through review"):
+            kb.complete_task(conn, tid, summary="shipped it",
+                             metadata={"head_sha": SHA_A})
+        assert kb.get_task(conn, tid).status == before
+        ev = _events(conn, tid, kb.REVIEW_REQUIRED_BLOCKED_EVENT)
+        assert ev and ev[0]["status"] == before
+        assert "code card" in ev[0]["reason"]
+
+
+def test_code_card_cannot_skip_review_even_with_an_orda_pass(kanban_home, cfg):
+    with kb.connect() as conn:
+        tid = _code_card(conn)
+        kb.record_orda_pass(conn, tid, sha=SHA_A, receipt_id="r",
+                            actor="orda", env={})
+        with pytest.raises(kb.ReviewRequiredError):
+            kb.complete_task(conn, tid, summary="x", head_sha=SHA_A)
+
+
+def test_code_card_ships_through_review_with_orda_pass(kanban_home, cfg):
+    with kb.connect() as conn:
+        tid = _code_card(conn)
+        run = kb.get_task(conn, tid).current_run_id
+        assert kb.request_review(conn, tid, summary="built",
+                                 expected_run_id=run, reviewer="orda")
+        assert kb.claim_review_task(conn, tid) is not None
+        review_run = kb.get_task(conn, tid).current_run_id
+        with pytest.raises(kb.OrdaPassRequiredError):
+            kb.complete_task(conn, tid, summary="lgtm", head_sha=SHA_A,
+                             expected_run_id=review_run)
+        kb.record_orda_pass(conn, tid, sha=SHA_A, receipt_id="r",
+                            actor="orda", env={"HERMES_KANBAN_TASK": tid})
+        assert kb.complete_task(conn, tid, summary="lgtm", head_sha=SHA_A,
+                                expected_run_id=review_run)
+        assert kb.get_task(conn, tid).status == "done"
+
+
+@pytest.mark.parametrize("kind", ["scratch", "dir"])
+def test_non_code_cards_keep_direct_completion(kanban_home, cfg, kind):
+    with kb.connect() as conn:
+        tid = _code_card(conn, kind=kind)
+        assert kb.code_card_reason(conn, tid) is None
+        assert kb.complete_task(conn, tid, summary="done")
+        assert kb.get_task(conn, tid).status == "done"
+
+
+def test_terminal_code_card_still_returns_false(kanban_home, cfg):
+    with kb.connect() as conn:
+        tid = _code_card(conn)
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))
+        assert kb.complete_task(conn, tid, summary="again") is False
+        assert _events(conn, tid, kb.REVIEW_REQUIRED_BLOCKED_EVENT) == []
+
+
+def test_code_card_rule_can_be_disabled_explicitly(kanban_home, cfg):
+    cfg["code_cards_require_review"] = False
+    with kb.connect() as conn:
+        tid = _code_card(conn)
+        assert kb.complete_task(conn, tid, summary="done")
+
+
+def test_cli_complete_refuses_code_card(kanban_home, cfg):
+    with kb.connect() as conn:
+        tid = _code_card(conn, status_path="ready")
+    out = kcli.run_slash(f"complete {tid} --summary shipped")
+    assert "through review" in out
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "ready"

@@ -19,6 +19,14 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
+@pytest.fixture(autouse=True)
+def _code_card_review_gate_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests cover worktree teardown on completion, not the rule that
+    code cards must ship through review (t_159b0030), which is exercised
+    in test_kanban_review_guard.py."""
+    monkeypatch.setattr(kb, "code_cards_require_review_enabled", lambda: False)
+
+
 def _git(*args: str, cwd: str | None = None) -> str:
     result = subprocess.run(
         ["git", *args],

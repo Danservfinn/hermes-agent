@@ -904,9 +904,13 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                         summary=payload.summary,
                         metadata=payload.metadata,
                     )
-                except kanban_db.OrdaPassRequiredError as e:
+                except (
+                    kanban_db.OrdaPassRequiredError,
+                    kanban_db.ReviewRequiredError,
+                ) as e:
                     # Review approval without an Orda PASS for the exact
-                    # head sha (t_159b0030). Task was not mutated.
+                    # head sha, or a code card skipping review
+                    # (t_159b0030). Task was not mutated.
                     raise HTTPException(status_code=409, detail=str(e))
             elif s == "blocked":
                 ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
@@ -1353,8 +1357,11 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                                 summary=payload.summary,
                                 metadata=payload.metadata,
                             )
-                        except kanban_db.OrdaPassRequiredError as e:
-                            # Orda PASS gate (t_159b0030). Record the
+                        except (
+                            kanban_db.OrdaPassRequiredError,
+                            kanban_db.ReviewRequiredError,
+                        ) as e:
+                            # Ship gates (t_159b0030). Record the
                             # specific reason; ok stays truthy so the
                             # generic "refused" message below does not
                             # overwrite it.

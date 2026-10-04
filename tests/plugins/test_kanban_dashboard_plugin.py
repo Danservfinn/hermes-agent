@@ -1276,3 +1276,28 @@ def test_dashboard_review_approval_requires_orda_pass(client):
     assert r.status_code == 200, r.text
     with kb.connect() as conn:
         assert kb.get_task(conn, tid).status == "done"
+
+
+def test_dashboard_refuses_code_card_skipping_review(client):
+    """t_159b0030: a worktree (code) card cannot be dragged to done from a
+    non-review column, via PATCH or bulk."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="code", assignee="kublai")
+        conn.execute(
+            "UPDATE tasks SET workspace_kind='worktree' WHERE id=?", (tid,),
+        )
+        plain = kb.create_task(conn, title="plain", assignee="kublai")
+    r = client.patch(f"/api/plugins/kanban/tasks/{tid}",
+                     json={"status": "done"})
+    assert r.status_code == 409
+    assert "through review" in r.json()["detail"]
+    r = client.post("/api/plugins/kanban/tasks/bulk",
+                    json={"ids": [tid, plain], "status": "done"})
+    assert r.status_code == 200
+    by_id = {e["id"]: e for e in r.json()["results"]}
+    assert by_id[tid]["ok"] is False
+    assert "through review" in by_id[tid]["error"]
+    assert by_id[plain]["ok"] is True
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "ready"
+        assert kb.get_task(conn, plain).status == "done"

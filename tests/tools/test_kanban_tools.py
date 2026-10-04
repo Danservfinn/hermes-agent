@@ -132,6 +132,29 @@ def test_complete_happy_path(worker_env):
         conn.close()
 
 
+def test_complete_refuses_code_card_outside_review(worker_env):
+    """t_159b0030: a worker on a worktree (code) card cannot call
+    kanban_complete from its implementation run; it must request review."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "UPDATE tasks SET workspace_kind='worktree' WHERE id=?",
+            (worker_env,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    from tools import kanban_tools as kt
+    out = json.loads(kt._handle_complete({"summary": "merged and deployed"}))
+    assert "through review" in out["error"]
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+    finally:
+        conn.close()
+
+
 def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
     """After a phantom rejection, retrying kanban_complete with
     created_cards=[] (the documented escape hatch) must complete the
