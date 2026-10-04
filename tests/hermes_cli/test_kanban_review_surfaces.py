@@ -234,7 +234,16 @@ def test_worker_guidance_distinguishes_same_card_and_downstream_review() -> None
     assert "inspect those cards" in KANBAN_GUIDANCE
     assert "pre-created review, QA, or release child" in KANBAN_GUIDANCE
     assert "call `kanban_complete`" in KANBAN_GUIDANCE
-    assert "Never sticky-block that parent for `review-required`" in KANBAN_GUIDANCE
+    assert "never sticky-block that parent for `review-required`" in KANBAN_GUIDANCE
+    # t_159b0030: code cards go to review instead of kanban_complete.
+    assert "**Code cards** (a `worktree` workspace, or any card linked to a" in KANBAN_GUIDANCE
+    assert "Do NOT call `kanban_complete`" in KANBAN_GUIDANCE
+    assert "`ReviewRequiredError`" in KANBAN_GUIDANCE
+    assert '"head_sha"' in KANBAN_GUIDANCE
+    assert "**Non-code cards** (a `scratch` workspace, or a `dir` workspace" in KANBAN_GUIDANCE
+    assert "builder never reviews, approves, or passes its" in KANBAN_GUIDANCE
+    assert "`kanban.reviewer_profiles`" in KANBAN_GUIDANCE
+    assert "hermes kanban ship-gate <task-id> --sha <sha>" in KANBAN_GUIDANCE
     assert "`kanban_request_changes`" in KANBAN_GUIDANCE
     assert "metadata=..." in KANBAN_GUIDANCE
     kanban_defaults = DEFAULT_CONFIG["kanban"]

@@ -226,9 +226,12 @@ up on the next tick (60s by default).
 kanban:
   dispatch_in_gateway: true        # default
   dispatch_interval_seconds: 60    # default
-  review_dispatch: true            # default: spawn the assigned profile with
-                                   # the bundled sdlc-review skill. Set false
-                                   # for human-only review boards.
+  review_dispatch: true            # default: spawn a reviewer for cards in
+                                   # review with the bundled sdlc-review
+                                   # skill. If the assignee built the card,
+                                   # the reviewer comes from
+                                   # kanban.reviewer_profiles instead. Set
+                                   # false for human-only review boards.
 ```
 
 Override the config flag at runtime via `HERMES_KANBAN_DISPATCH_IN_GATEWAY=0`
@@ -296,8 +299,8 @@ parent, missing input, unmet capability) before unblocking, or raise
 |---|---|---|
 | `kanban_show` | Read the current task (title, body, prior attempts, parent handoffs, comments, full pre-formatted `worker_context`). Defaults to the env's task id. | — |
 | `kanban_list` | List task summaries with filters for `assignee`, `status`, `tenant`, archived visibility, and limit. Intended for orchestrators discovering board work. | — |
-| `kanban_complete` | Finish with `summary` + `metadata` structured handoff. | at least one of `summary` / `result` |
-| `kanban_request_review` | Start same-card review with a durable `summary`, optional `metadata`, and optional reviewer profile. The task moves to `review`; this is not a block. | `summary` |
+| `kanban_complete` | Finish with `summary` + `metadata` structured handoff. Refused with `ReviewRequiredError` for a code card (a `worktree` workspace, or any card linked to a project) in `running`, `ready`, or `blocked`; those cards request review instead. | at least one of `summary` / `result` |
+| `kanban_request_review` | Start same-card review with a durable `summary`, optional `metadata`, and optional reviewer profile. The task moves to `review`; this is not a block. This is how a code card finishes its implementation run; put the full head sha in `metadata.head_sha`. | `summary` |
 | `kanban_request_changes` | Reviewer verdict from an active review run. Closes that run, reapplies parent gating, and routes the task to its original implementer without block-loop accounting. | `reason` |
 | `kanban_block` | Stop work and route by why: `kind=dependency` (waits in `todo`, auto-resumes), `needs_input`/`capability`/`transient` (surface to a human). Repeated same-kind re-blocks auto-escalate to `triage`. | `reason` |
 | `kanban_heartbeat` | Signal liveness during long operations. Pure side-effect. | — |
@@ -322,6 +325,21 @@ kanban_complete(
     metadata={"changed_files": ["limiter.py", "tests/test_limiter.py"], "tests_run": 14},
 )
 ```
+
+That final `kanban_complete` is right for a non-code card (a `scratch` workspace, or a `dir` workspace with no project). A code card (a `worktree` workspace, or any card linked to a project) commits its work and ends with `kanban_request_review` instead, because the kernel refuses `kanban_complete` from `running`, `ready`, or `blocked` with `ReviewRequiredError`:
+
+```
+kanban_request_review(
+    summary="migrated limiter.py to token-bucket; added 14 tests, all pass",
+    metadata={
+        "changed_files": ["limiter.py", "tests/test_limiter.py"],
+        "tests_run": 14,
+        "head_sha": "<full 40-char sha of the commit to review>",
+    },
+)
+```
+
+The card's builder never reviews, approves, or passes its own card. Approval needs an Orda PASS on the exact head sha (see [Review gate config](#review-gate-config)), and merge or deploy happens only after `hermes kanban ship-gate <task-id> --sha <sha>` passes on that exact sha.
 
 An **orchestrator** worker fans out instead:
 
@@ -399,9 +417,14 @@ Every profile that works kanban tasks automatically gets the worker lifecycle �
 1. On spawn, call `kanban_show()` to read title + body + parent handoffs + prior attempts + full comment thread.
 2. `cd $HERMES_KANBAN_WORKSPACE` (via the terminal tool) and do the work there.
 3. Call `kanban_heartbeat(note="...")` every few minutes during long operations. **If your work may run longer than 1 hour, call `kanban_heartbeat` at least once an hour** — the dispatcher reclaims tasks that have been running past `kanban.dispatch_stale_timeout_seconds` (default 4 h) with no heartbeat in the last hour, on the assumption the worker crashed without cleanup. A reclaim is benign (the task goes back to `ready` for re-dispatch without a failure-counter tick) but you lose your current run's progress.
-4. Complete with `kanban_complete(summary="...", metadata={...})`, or `kanban_block(reason="...")` if stuck.
+4. Finish with the right terminal call for the card type:
+   - **Code card** (a `worktree` workspace, or any card linked to a project): commit, record the full head sha, and call `kanban_request_review(summary="...", metadata={"head_sha": "<sha>", ...})`. Do not call `kanban_complete`; it is refused with `ReviewRequiredError`, even when a pre-created review, QA, or release child depends on the card. Those children are released once the card reaches `done` through review.
+   - **Non-code card** (a `scratch` workspace, or a `dir` workspace with no project): complete with `kanban_complete(summary="...", metadata={...})`.
+   - Either kind: `kanban_block(reason="...")` if stuck.
 
-That final `kanban_complete` / `kanban_block` call is part of the worker
+The builder of a card never reviews or passes it. A reviewer that did not build the card approves it, and only after Orda has recorded a PASS on the exact head sha. Merge or deploy happens only after `hermes kanban ship-gate` passes on that exact sha.
+
+That final `kanban_complete` / `kanban_request_review` / `kanban_block` call is part of the worker
 protocol. If the worker process exits with status 0 while the task is still
 `running`, the dispatcher treats that as a protocol violation and emits a
 `protocol_violation` event.
@@ -802,6 +825,33 @@ kanban:
   auto_promote_children: false
   default_workdir: ~/work/active-project
 ```
+
+### Review gate config
+
+These keys (all under `kanban:` in `~/.hermes/config.yaml`) control who reviews code cards, who can record an Orda PASS, and whether unassigned cards are auto-assigned.
+
+| Config key | Default (key missing) | What it does |
+|------------|-----------------------|--------------|
+| `kanban.reviewer_profiles` | `["orda"]` | Ordered reviewer candidates. When a card in `review` is assigned to a profile that built it, the dispatcher reassigns it to the first candidate that did not build it and exists as a profile (`review_reassigned` event). With no eligible candidate the card stays in `review` unassigned, with a `review_reviewer_unavailable` event and a comment. Accepts a list or a comma separated string; a malformed value falls back to the default, and an explicit empty list means no candidates. |
+| `kanban.orda_profiles` | `["orda"]` | Profiles allowed to record an Orda PASS with `hermes kanban orda-pass <task-id> --sha <sha> --receipt <receipt-id>`. A profile that built the card can never record or use a PASS on it. Same list parsing as `reviewer_profiles`. |
+| `kanban.require_orda_pass` | `true` | Review approval (`kanban_complete` from the review lane, or a `review` card moved to `done`) requires an `orda_pass` event whose sha equals the exact head sha in `metadata.head_sha` (and, for a worktree card, the workspace HEAD). Only an explicit false value (`false`, `0`, `no`, `off`) disables it. `hermes kanban ship-gate` always requires a PASS, whatever this key says. |
+| `kanban.code_cards_require_review` | `true` | Code cards (a `worktree` workspace, or any card linked to a project) cannot go from `running`, `ready`, or `blocked` straight to `done`; `kanban_complete` raises `ReviewRequiredError` and the card must go through `kanban_request_review`. Non-code cards (a `scratch` workspace, or a `dir` workspace with no project) are not affected. Only an explicit false value disables it. |
+| `kanban.auto_assign_unassigned` | `false` | Lets `kanban.default_assignee` claim unassigned `ready` cards. Off unless explicitly true (`true`, `1`, `yes`, `on`). Cards created with `--no-auto-assign` are never auto-assigned. |
+| `kanban.auto_assign_skip_creators` | `[]` | Profiles whose cards are never auto-assigned, even when `auto_assign_unassigned` is true. |
+
+Set `require_orda_pass` and `code_cards_require_review` to an explicit `true`. A missing key is safe, but a key that is present with an empty value (YAML null) or `[]` currently evaluates to false and switches the gate off.
+
+```yaml
+kanban:
+  reviewer_profiles: [orda]
+  orda_profiles: [orda]
+  require_orda_pass: true
+  code_cards_require_review: true
+  auto_assign_unassigned: false
+  auto_assign_skip_creators: []
+```
+
+Before any merge or deploy, run `hermes kanban ship-gate <task-id> --sha <sha>` and abort on a non-zero exit. It exits 0 only when an Orda PASS exists on that card for exactly that sha.
 
 ### Scheduled task starts (`scheduled_at`)
 

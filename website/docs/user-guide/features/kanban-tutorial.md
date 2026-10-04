@@ -84,6 +84,8 @@ kanban_complete(
 )
 ```
 
+These cards use the default `scratch` workspace, so `kanban_complete` is the right finish. A code card (a `worktree` workspace, or any card linked to a project) cannot finish this way: it commits, records the head sha, and calls `kanban_request_review` instead (see Story 3).
+
 `kanban_show` defaults `task_id` to `$HERMES_KANBAN_TASK`, so the worker doesn't need to know its own id. `kanban_complete` writes the summary + metadata onto the current `task_runs` row, closes that run, and transitions the task to `done` — all in one atomic hop through `kanban_db`.
 
 When `SCHEMA` hits `done`, the dependency engine promotes `API` to `ready` automatically. The API worker, when it picks up, will call `kanban_show()` and see `SCHEMA`'s summary and metadata attached to the parent handoff — so it knows the schema decisions without re-reading a long design doc.
@@ -149,9 +151,9 @@ The dashboard view, filtered by `auth-project`:
 
 ![Pipeline view for a multi-role feature](/img/kanban-tutorial/08-pipeline-auth.png)
 
-The screenshot uses the **pre-created downstream card** model: the implementation card has a dedicated reviewer child. In that model the engineer must call `kanban_complete` when implementation is ready so the reviewer child can leave `todo`. Never block the implementation parent merely to ask for review.
+The screenshot uses the **pre-created downstream card** model: the implementation card has a dedicated reviewer child. For a non-code implementation card, the engineer calls `kanban_complete` when implementation is ready so the reviewer child can leave `todo`. An implementation card that changes code (a `worktree` workspace, or any card linked to a project) must not call `kanban_complete`; the kernel refuses it with `ReviewRequiredError`. It commits, records the full head sha, and calls `kanban_request_review` on the same card, as shown below. The reviewer child leaves `todo` only after that card reaches `done` through review. Never block the implementation parent merely to ask for review.
 
-For workflows where the same card owns implementation and review, use the first-class review lifecycle instead. The full implement → review → changes → re-review choreography is:
+For code cards, and for any workflow where the same card owns implementation and review, use the first-class review lifecycle. The card's builder never reviews or passes its own card: when the assignee built it, the dispatcher hands review to a profile from `kanban.reviewer_profiles` that did not. The full implement → review → changes → re-review choreography is:
 
 ```python
 # --- Engineer: first implementation attempt ---
@@ -159,7 +161,11 @@ kanban_show()
 # (write code, run tests, prepare the candidate)
 kanban_request_review(
     summary="implemented reset flow; candidate is ready for review",
-    metadata={"changed_files": ["auth/reset.py"], "tests_run": 8},
+    metadata={
+        "changed_files": ["auth/reset.py"],
+        "tests_run": 8,
+        "head_sha": "<full 40-char sha of the commit to review>",
+    },
     reviewer="reviewer",
 )
 # → the same card enters review; the implementation run closes as
@@ -187,22 +193,28 @@ kanban_request_review(
         ],
         "tests_run": 11,
         "review_iteration": 2,
+        "head_sha": "<full 40-char sha of the new commit>",
     },
     reviewer="reviewer",
 )
 
-# --- Reviewer: approve ---
-kanban_complete(summary="review passed; acceptance criteria verified")
+# --- Reviewer: approve (needs an Orda PASS on this exact sha) ---
+kanban_complete(
+    summary="review passed; acceptance criteria verified",
+    metadata={"review_outcome": "approved", "head_sha": "<same full sha>"},
+)
 # → done
 ```
 
+The approval is refused unless Orda has recorded a PASS for that exact head sha (`hermes kanban orda-pass <task-id> --sha <sha> --receipt <receipt-id>`, Orda profiles only). Merge or deploy only after `hermes kanban ship-gate <task-id> --sha <sha>` exits 0 for the exact sha being shipped.
+
 The task's run history now records `review_requested → changes_requested → review_requested → completed`. Each attempt has its own actor, summary, metadata, and outcome, so the second engineer sees exactly what the reviewer rejected and the final approval remains auditable. `kanban_block` is reserved for a real external escalation (missing access, a product decision, unavailable infrastructure), not normal review feedback.
 
-If you intentionally use the downstream-card model shown in the screenshot, the reviewer opens `Review password reset PR` after its implementation parent completes:
+If you intentionally use the downstream-card model shown in the screenshot, the reviewer opens `Review password reset PR` after its implementation parent reaches `done` (for a code card, through the same-card review above):
 
 ![Reviewer's drawer view of the pipeline](/img/kanban-tutorial/09-drawer-pipeline-review.png)
 
-The reviewer card's `worker_context` includes the completed implementation handoff. That is a separate card workflow; do not combine it with same-card `kanban_request_review` or you will duplicate the review lane.
+The reviewer card's `worker_context` includes the completed implementation handoff. That is a separate card workflow. For a non-code parent, do not combine it with same-card `kanban_request_review` or you will duplicate the review lane. A code parent always goes through same-card review first.
 
 ## Story 4 — Circuit breaker and crash recovery
 

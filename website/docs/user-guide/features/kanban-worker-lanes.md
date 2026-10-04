@@ -50,8 +50,8 @@ For non-Hermes lanes (registered via a plugin), the plugin supplies its own `spa
 
 Every claim must end in exactly one of:
 
-- `kanban_complete(summary=..., metadata=...)` — task succeeds, status flips to `done`.
-- `kanban_request_review(summary=..., metadata=..., reviewer=...)` — same-card implementation is complete and enters first-class review; status flips to `review`. The dispatcher loads the bundled `sdlc-review` skill unless `kanban.review_dispatch` is disabled. A reviewer approves with `kanban_complete`, returns actionable rework with `kanban_request_changes`, or escalates a genuine external blocker with `kanban_block`.
+- `kanban_complete(summary=..., metadata=...)`: task succeeds, status flips to `done`. Only non-code cards (a `scratch` workspace, or a `dir` workspace with no project) and review-lane approvals may finish this way. On a code card (a `worktree` workspace, or any card linked to a project) the kernel refuses it from `running`, `ready`, or `blocked` with `ReviewRequiredError`.
+- `kanban_request_review(summary=..., metadata=..., reviewer=...)`: same-card implementation is complete and enters first-class review; status flips to `review`. This is how every code card finishes its implementation run. The dispatcher loads the bundled `sdlc-review` skill unless `kanban.review_dispatch` is disabled. A reviewer approves with `kanban_complete` (only once an Orda PASS exists on the exact head sha, passed as `metadata.head_sha`), returns actionable rework with `kanban_request_changes`, or escalates a genuine external blocker with `kanban_block`.
 - `kanban_block(reason=...)` — task waits for human input, status flips to `blocked`. The dispatcher respawns when `kanban_unblock` runs.
 - The worker process exits without a tool call. The kernel reaps it and emits `crashed` (PID died) or `gave_up` (consecutive-failure breaker tripped) or `timed_out` (max_runtime exceeded). This is the failure path; healthy workers don't end here.
 
@@ -59,15 +59,20 @@ The kanban kernel enforces that exactly one of these terminates each run. A work
 
 ## Outputs and the review handoff
 
-For code-changing tasks, pick the review model encoded by the task graph:
+Code cards (a `worktree` workspace, or any card linked to a project) always finish their implementation run through same-card review:
+
+- **Code cards:** commit the work, record the full head sha, and call `kanban_request_review(summary=..., metadata={"head_sha": "<full 40-char sha>", ...})`. Do not call `kanban_complete`; the kernel refuses it from `running`, `ready`, or `blocked` with `ReviewRequiredError`. This applies even when a pre-created downstream review/QA/release card depends on the implementation card: those children are released once the card reaches `done` through review. The card's builder never reviews, approves, or passes its own card. When the assignee built the card, the dispatcher hands review to a profile from `kanban.reviewer_profiles` that did not. Approval needs an Orda PASS (`hermes kanban orda-pass`, Orda profiles only) on the exact head sha, and any merge or deploy must first pass `hermes kanban ship-gate <task-id> --sha <sha>` on that exact sha.
+
+For non-code cards, pick the review model encoded by the task graph:
+
 
 - **Same-card review:** call `kanban_request_review(summary=..., metadata=..., reviewer=...)`. The task enters `review` without touching block recurrence accounting. The dispatcher claims it with the bundled `sdlc-review` skill by default. The reviewer approves with `kanban_complete`, calls `kanban_request_changes(reason=...)` to close the review run and route the task back to its original implementer, or blocks only for a genuine external escalation.
-- **Pre-created downstream review/QA/release card:** `kanban_show` lists child IDs; inspect those cards with `kanban_show(task_id=...)` before choosing the terminal action. When a child is the downstream review/QA/release phase, call `kanban_complete` on the implementation phase. It cannot promote until this parent is `done`/`archived`. Do not additionally request same-card review and never sticky-block the parent with `review-required:` — either choice strands or duplicates the downstream lane.
+- **Pre-created downstream review/QA/release card:** `kanban_show` lists child IDs; inspect those cards with `kanban_show(task_id=...)` before choosing the terminal action. When a child is the downstream review/QA/release phase, call `kanban_complete` on a non-code implementation phase. It cannot promote until this parent is `done`/`archived`. Do not additionally request same-card review and never sticky-block the parent with `review-required:`; either choice strands or duplicates the downstream lane. A code card requests review instead, as described above.
 - **Human-only boards:** set `kanban.review_dispatch: false`. A task can then remain in `review` until a human approves it or uses `reopen-review`/the dashboard to return it to `ready`/`todo`.
 
 Both review models carry their structured handoff on the lifecycle transition itself. Do not place secrets, tokens, or raw PII in `summary` or `metadata`; run rows are durable.
 
-The injected `KANBAN_GUIDANCE` covers both graph shapes, `kanban_complete`, the same-card review loop, and `kanban_block` for genuine blockers.
+The injected `KANBAN_GUIDANCE` covers both graph shapes, the code-card review requirement, `kanban_complete` for non-code cards, the same-card review loop, and `kanban_block` for genuine blockers.
 
 ## Logs and audit trail
 
