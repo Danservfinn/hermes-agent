@@ -399,6 +399,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Initial card status. Use 'blocked' for cards "
                                "that require immediate human ops (R3 gate) "
                                "to skip the brief running-to-blocked transition.")
+    p_create.add_argument("--no-auto-assign", action="store_true",
+                          dest="no_auto_assign",
+                          help="Never let kanban.default_assignee claim this "
+                               "card, even when kanban.auto_assign_unassigned "
+                               "is enabled. Use for cards a coordinator files "
+                               "for a human to route.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -1613,6 +1619,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            no_auto_assign=bool(getattr(args, "no_auto_assign", False)),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -2778,6 +2785,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
+            "auto_assign_skipped": [
+                {"task_id": tid, "reason": why}
+                for (tid, why) in res.auto_assign_skipped
+            ],
             "review_reassigned": [
                 {"task_id": tid, "from": old, "to": new}
                 for (tid, old, new) in res.review_reassigned

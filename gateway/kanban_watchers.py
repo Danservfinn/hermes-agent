@@ -1350,13 +1350,24 @@ class GatewayKanbanWatchersMixin:
         # instead of skipping them indefinitely (#27145). Empty string
         # (the schema default) means "no fallback, keep skipping" —
         # backward-compatible with existing installs.
+        # t_159b0030: the dispatcher only applies it when
+        # kanban.auto_assign_unassigned is true (default false).
         default_assignee = (kanban_cfg.get("default_assignee") or "").strip() or None
         if default_assignee:
-            logger.info(
-                "kanban dispatcher: default_assignee=%r (unassigned ready tasks "
-                "will route to this profile)",
-                default_assignee,
-            )
+            if bool(kanban_cfg.get("auto_assign_unassigned", False)):
+                logger.info(
+                    "kanban dispatcher: default_assignee=%r (unassigned ready "
+                    "tasks will route to this profile unless marked "
+                    "no_auto_assign)",
+                    default_assignee,
+                )
+            else:
+                logger.info(
+                    "kanban dispatcher: default_assignee=%r is set but "
+                    "kanban.auto_assign_unassigned is false; unassigned ready "
+                    "tasks will NOT be auto-assigned",
+                    default_assignee,
+                )
 
         # Read kanban.max_in_progress_per_profile — per-profile concurrency
         # cap (#21582). When set, no single profile gets more than N

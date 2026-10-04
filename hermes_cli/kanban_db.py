@@ -3183,6 +3183,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    no_auto_assign: bool = False,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3222,6 +3223,10 @@ def create_task(
     in its own projects.db, a matching canonical project-linked task in this
     board can supply the repo and branch convention. Its literal worktree is
     never reused; the new task still gets its own task-id-keyed path.
+
+    ``no_auto_assign`` records a ``no_auto_assign`` marker in the same
+    transaction, so ``kanban.default_assignee`` can never claim the card
+    even when ``kanban.auto_assign_unassigned`` is enabled (t_159b0030).
     """
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
@@ -3554,6 +3559,11 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                if no_auto_assign:
+                    _append_event(
+                        conn, task_id, NO_AUTO_ASSIGN_EVENT,
+                        {"actor": created_by, "reason": "create"},
+                    )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
@@ -8123,6 +8133,11 @@ class DispatchResult:
     """Review tasks whose assignee was one of the card's builders and was
     replaced by an eligible reviewer this tick, as
     ``(task_id, builder, reviewer)`` (t_159b0030)."""
+    auto_assign_skipped: list[tuple[str, str]] = field(default_factory=list)
+    """Unassigned ready tasks that ``kanban.default_assignee`` did NOT claim,
+    as ``(task_id, reason)``. Only populated when a default assignee is
+    configured. Reasons: ``auto_assign_disabled``, ``no_auto_assign_marker``,
+    ``creator_skipped:<profile>`` (t_159b0030)."""
     review_no_eligible_reviewer: list[str] = field(default_factory=list)
     """Review tasks whose assignee was a builder and no eligible reviewer
     exists. They are left in ``review`` with the assignee cleared and a
@@ -10116,6 +10131,78 @@ def _enforce_orda_gate_for_completion(
 
 
 # ---------------------------------------------------------------------------
+# default_assignee auto-assign guard (t_159b0030)
+#
+# ``kanban.default_assignee`` used to claim every unassigned ``ready`` card
+# on the next dispatcher tick and spawn a worker for it within seconds,
+# including cards a coordinator filed for a human to route. Auto-assign is
+# now opt-in (``kanban.auto_assign_unassigned``, default false) and, when
+# enabled, still skips cards carrying a ``no_auto_assign`` marker event or
+# filed by a profile listed in ``kanban.auto_assign_skip_creators``.
+# ---------------------------------------------------------------------------
+
+NO_AUTO_ASSIGN_EVENT = "no_auto_assign"
+
+
+def auto_assign_unassigned_enabled() -> bool:
+    """Whether ``default_assignee`` may claim unassigned ready cards."""
+    raw = _kanban_config_section().get("auto_assign_unassigned", False)
+    if isinstance(raw, str):
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(raw)
+
+
+def auto_assign_skip_creators() -> list[str]:
+    """Creators whose cards are never auto-assigned (default empty)."""
+    return _config_profile_list("auto_assign_skip_creators", ())
+
+
+def mark_no_auto_assign(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> None:
+    """Record that ``task_id`` must never be auto-assigned by the dispatcher."""
+    with write_txn(conn, allow_nested=True):
+        if not conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone():
+            raise ValueError(f"unknown task {task_id}")
+        _append_event(
+            conn, task_id, NO_AUTO_ASSIGN_EVENT,
+            {"actor": actor, "reason": reason},
+        )
+
+
+def has_no_auto_assign_marker(conn: sqlite3.Connection, task_id: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? LIMIT 1",
+        (task_id, NO_AUTO_ASSIGN_EVENT),
+    ).fetchone() is not None
+
+
+def _auto_assign_skip_reason(
+    conn: sqlite3.Connection,
+    task_id: str,
+    created_by: Optional[str],
+    *,
+    enabled: bool,
+    skip_creators: Iterable[str],
+) -> Optional[str]:
+    """Why ``default_assignee`` must not claim this card, or ``None``."""
+    if not enabled:
+        return "auto_assign_disabled"
+    if has_no_auto_assign_marker(conn, task_id):
+        return "no_auto_assign_marker"
+    creator = _normalize_profile(created_by)
+    if creator and creator in set(skip_creators):
+        return f"creator_skipped:{creator}"
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Memory-aware dispatch guard (OOF-30 / OOF-77)
 #
 # Two production incidents ("larrikin-lollies", "synclare-task-manager")
@@ -10407,6 +10494,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    auto_assign_unassigned: Optional[bool] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -10442,6 +10530,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            auto_assign_unassigned=auto_assign_unassigned,
         )
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
@@ -10462,6 +10551,7 @@ def dispatch_once(
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
                 reconcile_orphans=reconcile_orphans,
+                auto_assign_unassigned=auto_assign_unassigned,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
@@ -10489,6 +10579,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    auto_assign_unassigned: Optional[bool] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -10524,6 +10615,12 @@ def _dispatch_once_locked(
     ``spawn_fn`` defaults to ``_default_spawn``. Tests pass a stub.
     ``board`` pins workspace/log/db resolution for this tick to a specific
     board. When omitted, the current-board resolution chain is used.
+
+    ``default_assignee`` only claims unassigned ready tasks when
+    ``auto_assign_unassigned`` is true (``None`` reads
+    ``kanban.auto_assign_unassigned``, default false), and never claims a
+    task with a ``no_auto_assign`` marker or one filed by a profile in
+    ``kanban.auto_assign_skip_creators`` (t_159b0030).
     """
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
@@ -10622,7 +10719,7 @@ def _dispatch_once_locked(
             spawn_budget = 1
 
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, created_by FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -10699,6 +10796,12 @@ def _dispatch_once_locked(
             # bucket it as nonspawnable if the profile genuinely isn't
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
+    _auto_assign_on = (
+        auto_assign_unassigned_enabled()
+        if auto_assign_unassigned is None
+        else bool(auto_assign_unassigned)
+    )
+    _auto_assign_skip = auto_assign_skip_creators() if _default_assignee else []
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:
             break
@@ -10714,7 +10817,20 @@ def _dispatch_once_locked(
             # board state consistent: the task is now legitimately owned
             # by ``kanban.default_assignee``, not "unassigned but secretly
             # routed".
+            #
+            # t_159b0030: auto-assign is opt-in and honours per-card and
+            # per-creator opt-outs, so coordinator-filed cards are not
+            # grabbed and spawned seconds after creation.
+            _skip_reason = None
             if _default_assignee and _default_assignee_resolved:
+                _skip_reason = _auto_assign_skip_reason(
+                    conn, row["id"], row["created_by"],
+                    enabled=_auto_assign_on,
+                    skip_creators=_auto_assign_skip,
+                )
+                if _skip_reason is not None:
+                    result.auto_assign_skipped.append((row["id"], _skip_reason))
+            if _default_assignee and _default_assignee_resolved and _skip_reason is None:
                 # Dry-run: show what WOULD happen (auto-assign + spawn) without
                 # mutating the DB. Real run: mutate the row + emit the
                 # 'assigned' event so the board state matches what just happened.

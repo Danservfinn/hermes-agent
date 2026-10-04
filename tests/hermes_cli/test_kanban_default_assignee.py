@@ -49,6 +49,8 @@ def test_unassigned_task_auto_assigned_with_default_assignee(isolated_kanban_hom
         res = kb.dispatch_once(
             conn, spawn_fn=_fake_spawn, dry_run=False,
             default_assignee="default",
+            # Auto-assign is opt-in since t_159b0030.
+            auto_assign_unassigned=True,
         )
     assert res.auto_assigned_default == [task_id]
     assert not res.skipped_unassigned

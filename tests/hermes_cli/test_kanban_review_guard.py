@@ -2,7 +2,9 @@
 
 Run 9018: the review lane spawned the card's own builder (``kublai``) as
 its reviewer; the builder approved, merged, and deployed its own work
-before the tester (``orda``) reviewed it.
+before the tester (``orda``) reviewed it. Separately,
+``kanban.default_assignee`` claimed every unassigned ready card within one
+dispatcher tick.
 
 Covers:
 
@@ -13,6 +15,8 @@ a. The review lane never assigns a builder (assignee at handoff,
 b. Review approval (and ``ship-gate``) require an ``orda_pass`` event for
    the exact head sha, recorded only by an Orda profile that did not build
    the card.
+c. ``default_assignee`` auto-assign is opt-in and honours
+   ``no_auto_assign`` markers and ``auto_assign_skip_creators``.
 """
 
 from __future__ import annotations
@@ -398,3 +402,70 @@ def test_cli_slash_ship_gate_refuses(kanban_home, cfg):
     out = kcli.run_slash(f"ship-gate {tid} --sha {SHA_A}")
     assert "REFUSED" in out
     assert "orda-pass" in kcli._DELEGATED_CHILD_DENIED_ACTIONS
+
+
+# ---------------------------------------------------------------------------
+# c. default_assignee auto-assign
+# ---------------------------------------------------------------------------
+
+
+def test_default_assignee_no_longer_auto_assigns_by_default(
+    kanban_home, cfg, spawns,
+):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="filed by khan", assignee=None,
+                             created_by="ogedei")
+        res = kb.dispatch_once(conn, spawn_fn=spawns, default_assignee="kublai")
+        assert spawns.calls == []
+        assert res.auto_assigned_default == []
+        assert res.auto_assign_skipped == [(tid, "auto_assign_disabled")]
+        assert tid in res.skipped_unassigned
+        assert _assignee(conn, tid) is None
+        assert _events(conn, tid, "assigned") == []
+
+
+def test_no_auto_assign_marker_wins_when_enabled(kanban_home, cfg, spawns):
+    cfg["auto_assign_unassigned"] = True
+    with kb.connect() as conn:
+        marked = kb.create_task(conn, title="route me", assignee=None,
+                                created_by="ogedei", no_auto_assign=True)
+        later = kb.create_task(conn, title="mark later", assignee=None,
+                               created_by="dashboard")
+        kb.mark_no_auto_assign(conn, later, actor="ogedei", reason="human")
+        plain = kb.create_task(conn, title="plain", assignee=None,
+                               created_by="dashboard")
+        res = kb.dispatch_once(conn, spawn_fn=spawns, default_assignee="kublai")
+        assert res.auto_assigned_default == [plain]
+        assert set(res.auto_assign_skipped) == {
+            (marked, "no_auto_assign_marker"),
+            (later, "no_auto_assign_marker"),
+        }
+        assert _assignee(conn, marked) is None
+        assert _assignee(conn, later) is None
+        assert spawns.calls == [(plain, "kublai")]
+
+
+def test_skip_creators_when_enabled(kanban_home, cfg, spawns):
+    cfg["auto_assign_unassigned"] = True
+    cfg["auto_assign_skip_creators"] = ["Ogedei"]
+    with kb.connect() as conn:
+        khan = kb.create_task(conn, title="khan card", assignee=None,
+                              created_by="ogedei")
+        res = kb.dispatch_once(conn, spawn_fn=spawns, default_assignee="kublai")
+        assert res.auto_assign_skipped == [(khan, "creator_skipped:ogedei")]
+        assert spawns.calls == []
+
+
+def test_explicit_dispatch_flag_overrides_config(kanban_home, cfg, spawns):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="t", assignee=None)
+        res = kb.dispatch_once(conn, spawn_fn=spawns, default_assignee="kublai",
+                               auto_assign_unassigned=True)
+        assert res.auto_assigned_default == [tid]
+
+
+def test_cli_create_no_auto_assign_flag(kanban_home, cfg):
+    out = kcli.run_slash("create 'khan filed' --no-auto-assign --json")
+    tid = json.loads(out[out.index("{"):])["id"]
+    with kb.connect() as conn:
+        assert kb.has_no_auto_assign_marker(conn, tid)
