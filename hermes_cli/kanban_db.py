@@ -9753,11 +9753,11 @@ def _load_event_payload(raw: Any) -> dict:
 
 
 def card_builder_profiles(conn: sqlite3.Connection, task_id: str) -> set[str]:
-    """Return every profile that must never review or pass ``task_id``.
+    """Return every profile that BUILT ``task_id``.
 
+    Builders must never review the card or record an Orda PASS for it.
     The set is the union of:
 
-    * ``tasks.created_by`` (the profile that filed the card),
     * each ``implementer`` recorded on ``review_requested`` and
       ``changes_requested`` events (the assignee at handoff time),
     * the profile of every worker run that was claimed from an
@@ -9765,19 +9765,14 @@ def card_builder_profiles(conn: sqlite3.Connection, task_id: str) -> set[str]:
       ``source_status`` is not ``review``). Review runs are excluded so
       the reviewer who requested changes can re-review the fix.
 
-    The current assignee is deliberately not added on its own: after
-    ``request_review(reviewer=...)`` it is the designated reviewer. If it
-    is the builder, it is already in the set via one of the rules above.
+    ``tasks.created_by`` is deliberately not included: filing a card is
+    not building it, so Orda may review and pass a card Orda filed as
+    long as Orda never built it. The current assignee is not added on
+    its own either: after ``request_review(reviewer=...)`` it is the
+    designated reviewer. If it is the builder, it is already in the set
+    via one of the rules above.
     """
     builders: set[str] = set()
-    row = conn.execute(
-        "SELECT created_by FROM tasks WHERE id = ?", (task_id,),
-    ).fetchone()
-    if row is None:
-        return builders
-    creator = _normalize_profile(row["created_by"])
-    if creator:
-        builders.add(creator)
     for ev in conn.execute(
         "SELECT kind, payload FROM task_events WHERE task_id = ? "
         "AND kind IN ('review_requested', 'changes_requested')",

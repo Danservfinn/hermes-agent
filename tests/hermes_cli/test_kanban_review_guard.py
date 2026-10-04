@@ -8,8 +8,9 @@ dispatcher tick.
 
 Covers:
 
-a. The review lane never assigns a builder (assignee at handoff,
-   ``created_by``, or any profile that ran an implementation worker).
+a. The review lane never assigns a builder (implementer recorded at
+   handoff, or any profile that ran an implementation worker). Filing a
+   card (``created_by``) does not make a profile a builder.
    With no eligible reviewer the card stays in review unassigned with an
    event and a comment.
 b. Review approval (and ``ship-gate``) require an ``orda_pass`` event for
@@ -150,13 +151,14 @@ def test_no_eligible_reviewer_leaves_card_unassigned_in_review(
         assert len(kb.list_comments(conn, tid)) == 1
 
 
-def test_created_by_and_run_history_profiles_are_excluded(
+def test_run_history_profiles_are_excluded_but_not_the_creator(
     kanban_home, cfg, spawns,
 ):
-    cfg["reviewer_profiles"] = ["orda", "jochi", "chagatai"]
+    cfg["reviewer_profiles"] = ["jochi", "kublai", "ogedei", "chagatai"]
     with kb.connect() as conn:
-        # Filed by orda; first implementation attempt by jochi, then kublai.
-        tid = kb.create_task(conn, title="x", assignee="jochi", created_by="orda")
+        # Filed by ogedei; first implementation attempt by jochi, then kublai.
+        tid = kb.create_task(conn, title="x", assignee="jochi",
+                             created_by="ogedei")
         first = kb.claim_task(conn, tid)
         assert first is not None
         conn.execute(
@@ -172,9 +174,35 @@ def test_created_by_and_run_history_profiles_are_excluded(
         assert kb.request_review(
             conn, tid, summary="done", expected_run_id=second.current_run_id,
         )
-        assert kb.card_builder_profiles(conn, tid) == {"orda", "jochi", "kublai"}
+        assert kb.card_builder_profiles(conn, tid) == {"jochi", "kublai"}
         kb.dispatch_once(conn, spawn_fn=spawns)
-        assert spawns.calls == [(tid, "chagatai")]
+        # jochi and kublai built it; ogedei only filed it, so is eligible.
+        assert spawns.calls == [(tid, "ogedei")]
+
+
+def test_orda_files_kublai_builds_orda_reviews_and_passes(
+    kanban_home, cfg, spawns,
+):
+    """Temujin ruling on Q4: the creator is not barred for being the
+    creator. Orda files the card, Kublai builds it, Orda reviews it,
+    records the PASS for the exact sha, and approves it."""
+    with kb.connect() as conn:
+        tid = _built_and_handed_to_review(conn, builder="kublai",
+                                          created_by="orda")
+        assert kb.card_builder_profiles(conn, tid) == {"kublai"}
+        res = kb.dispatch_once(conn, spawn_fn=spawns)
+        assert spawns.calls == [(tid, "orda")]
+        assert res.review_reassigned == [(tid, "kublai", "orda")]
+        assert res.review_no_eligible_reviewer == []
+        kb.record_orda_pass(conn, tid, sha=SHA_A, receipt_id="orda-own-card",
+                            actor="orda", env={"HERMES_KANBAN_TASK": tid})
+        assert kb.complete_task(
+            conn, tid, summary="Orda verified", head_sha=SHA_A,
+            expected_run_id=kb.get_task(conn, tid).current_run_id,
+        )
+        assert kb.get_task(conn, tid).status == "done"
+        done = _events(conn, tid, "completed")[-1]
+        assert done["orda_pass"]["reviewer"] == "orda"
 
 
 def test_reviewer_can_rereview_after_requesting_changes(kanban_home, cfg, spawns):
@@ -295,13 +323,32 @@ def test_only_independent_orda_may_record_a_pass(kanban_home, cfg, spawns):
         with pytest.raises(ValueError, match="receipt_id"):
             kb.record_orda_pass(conn, tid, sha=SHA_A, receipt_id=" ",
                                 actor="orda", env={})
-        # A card orda filed (or built) cannot be passed by orda.
-        own = kb.create_task(conn, title="orda's own", assignee="kublai",
-                             created_by="orda")
+        # A card orda BUILT (ran an implementation worker on) cannot be
+        # passed by orda, even though someone else filed it.
+        own = kb.create_task(conn, title="orda built", assignee="orda",
+                             created_by="ogedei")
+        assert kb.claim_task(conn, own) is not None
         with pytest.raises(PermissionError, match="built"):
             kb.record_orda_pass(conn, own, sha=SHA_A, receipt_id="r",
                                 actor="orda", env={})
+        # Implementer recorded at handoff is a builder too.
+        handed = kb.create_task(conn, title="handed", assignee="orda")
+        assert kb.request_review(conn, handed, summary="x", reviewer="kublai")
+        with pytest.raises(PermissionError, match="built"):
+            kb.record_orda_pass(conn, handed, sha=SHA_A, receipt_id="r",
+                                actor="orda", env={})
         assert _events(conn, tid, kb.ORDA_PASS_EVENT) == []
+
+
+def test_creator_alone_is_not_barred_from_passing(kanban_home, cfg):
+    with kb.connect() as conn:
+        tid = _built_and_handed_to_review(conn, created_by="orda",
+                                          reviewer="orda")
+        payload = kb.record_orda_pass(conn, tid, sha=SHA_A, receipt_id="r",
+                                      actor="orda", env={})
+        assert payload["reviewer"] == "orda"
+        ok, reason, _ = kb.check_ship_allowed(conn, tid, SHA_A)
+        assert ok, reason
 
 
 def test_builder_worker_shell_cannot_record_pass(kanban_home, cfg, spawns):
